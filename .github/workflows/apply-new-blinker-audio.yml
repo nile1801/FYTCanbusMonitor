@@ -1,4 +1,4 @@
-name: Ghép file âm thanh xi nhan mới
+name: Chẩn đoán dữ liệu âm thanh xi nhan
 
 on:
   push:
@@ -8,31 +8,38 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  apply:
+  diagnose:
     runs-on: ubuntu-latest
     steps:
       - name: Lấy mã nguồn nhánh tạm
         uses: actions/checkout@v4
         with:
           ref: new-blinker-audio-vietnamese-ui
-          fetch-depth: 0
 
-      - name: Ghép và kiểm tra đúng file MP3 đã tải lên
-        shell: bash
+      - name: Kiểm tra từng mảnh Base64
+        shell: python
         run: |
-          cat .tmp-blinker/chunk*.b64 | tr -d '\r\n' | base64 -d > example/src/main/res/raw/turn_signal.mp3
-          echo "7dd620192b7cd79aa5cb85014ee50bebdef40402658b0eb84aa8dfa19b658d42  example/src/main/res/raw/turn_signal.mp3" | sha256sum -c -
-          test "$(stat -c%s example/src/main/res/raw/turn_signal.mp3)" = "91374"
-          rm -rf .tmp-blinker
+          import base64
+          import glob
+          import hashlib
+          import re
 
-      - name: Lưu file MP3 chính xác vào nhánh tạm
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Thay âm thanh xi nhan bằng đúng file MP3 mới" || exit 0
-          git push origin HEAD:new-blinker-audio-vietnamese-ui
+          parts = []
+          for path in sorted(glob.glob('.tmp-blinker/chunk*.b64')):
+              text = open(path, encoding='utf-8').read().replace('\r', '').replace('\n', '')
+              bad = ''.join(sorted(set(re.sub(r'[A-Za-z0-9+/=]', '', text))))
+              print(f'{path} bytes={len(text)} mod4={len(text) % 4} first={text[:12]} last={text[-12:]} invalid={bad!r}')
+              parts.append(text)
+
+          merged = ''.join(parts)
+          print(f'TOTAL bytes={len(merged)} mod4={len(merged) % 4}')
+          try:
+              audio = base64.b64decode(merged, validate=True)
+              print(f'DECODED_SIZE={len(audio)}')
+              print(f'SHA256={hashlib.sha256(audio).hexdigest()}')
+          except Exception as exc:
+              print(f'DECODE_ERROR={type(exc).__name__}: {exc}')
+          raise SystemExit(1)
