@@ -114,6 +114,7 @@ class TurnSignalService : Service() {
             ACTION_REFRESH -> refreshConfiguration()
             ACTION_TEST_SOUND -> {
                 audio.setVolume(SettingsStore.volume(this))
+                audio.setLoopGapMs(SettingsStore.loopGapMs(this))
                 audio.startTest()
             }
             ACTION_STOP_TEST -> audio.stopTest()
@@ -130,6 +131,7 @@ class TurnSignalService : Service() {
     private fun refreshConfiguration() {
         ruleEngine.setRules(RuleStore.load(this))
         audio.setVolume(SettingsStore.volume(this))
+        audio.setLoopGapMs(SettingsStore.loopGapMs(this))
         if (SettingsStore.isEnabled(this) && ruleEngine.active) {
             audio.setRuleActive(true)
         } else {
