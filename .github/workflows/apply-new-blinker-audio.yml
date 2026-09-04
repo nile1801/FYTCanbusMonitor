@@ -1,4 +1,4 @@
-name: Apply new blinker audio
+name: Ghép file âm thanh xi nhan mới
 
 on:
   push:
@@ -14,29 +14,25 @@ jobs:
   apply:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout branch
+      - name: Lấy mã nguồn nhánh tạm
         uses: actions/checkout@v4
         with:
           ref: new-blinker-audio-vietnamese-ui
           fetch-depth: 0
 
-      - name: Validate and rebuild MP3 from staged chunks
+      - name: Ghép và kiểm tra đúng file MP3 đã tải lên
         shell: bash
         run: |
-          for f in .tmp-blinker/chunk*.b64; do
-            echo "Checking $f ($(stat -c%s "$f") bytes)"
-            base64 -d "$f" >/dev/null
-          done
-          cat .tmp-blinker/chunk*.b64 | base64 -d > example/src/main/res/raw/turn_signal.mp3
+          cat .tmp-blinker/chunk*.b64 | tr -d '\r\n' | base64 -d > example/src/main/res/raw/turn_signal.mp3
           echo "7dd620192b7cd79aa5cb85014ee50bebdef40402658b0eb84aa8dfa19b658d42  example/src/main/res/raw/turn_signal.mp3" | sha256sum -c -
           test "$(stat -c%s example/src/main/res/raw/turn_signal.mp3)" = "91374"
           rm -rf .tmp-blinker
 
-      - name: Commit audio replacement
+      - name: Lưu file MP3 chính xác vào nhánh tạm
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "Replace turn signal MP3" || exit 0
+          git commit -m "Thay âm thanh xi nhan bằng đúng file MP3 mới" || exit 0
           git push origin HEAD:new-blinker-audio-vietnamese-ui
