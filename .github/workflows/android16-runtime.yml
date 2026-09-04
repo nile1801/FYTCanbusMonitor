@@ -1,4 +1,4 @@
-name: Android 16 Runtime Smoke Test
+name: Android Runtime Smoke Test
 
 on:
   pull_request:
@@ -9,9 +9,14 @@ permissions:
   contents: read
 
 jobs:
-  android16-runtime:
+  android-runtime:
+    name: android-${{ matrix.api-level }}-runtime
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [33, 36]
 
     steps:
       - name: Checkout
@@ -40,22 +45,27 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Android 16 launch + logcat
+      - name: Android API ${{ matrix.api-level }} launch + logcat
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 36
+          api-level: ${{ matrix.api-level }}
           arch: x86_64
           target: google_apis
           profile: pixel_6
           disable-animations: true
           script: |
             adb install -r example/build/outputs/apk/debug/example-debug.apk
+            adb shell pm grant com.aoe.canbusmonitor.turnsound android.permission.POST_NOTIFICATIONS || true
             adb logcat -c
-            adb shell am start -W -n com.aoe.canbusmonitor.turnsound/com.aoe.canbusmonitor.MainActivity || true
+            adb shell am start -W -n com.aoe.canbusmonitor.turnsound/com.aoe.canbusmonitor.MainActivity
             sleep 8
             echo '===== PROCESS ====='
-            adb shell pidof com.aoe.canbusmonitor.turnsound || true
+            PID="$(adb shell pidof com.aoe.canbusmonitor.turnsound | tr -d '\r')"
+            echo "$PID"
+            test -n "$PID"
             echo '===== CRASH LOG ====='
-            adb logcat -d -v threadtime | grep -E -A 100 -B 30 'FATAL EXCEPTION|AndroidRuntime|Process: com.aoe.canbusmonitor.turnsound' || true
+            CRASHES="$(adb logcat -d -v threadtime | grep -E -A 100 -B 30 'FATAL EXCEPTION|Process: com.aoe.canbusmonitor.turnsound' || true)"
+            echo "$CRASHES"
+            test -z "$CRASHES"
             echo '===== ACTIVITY STATE ====='
             adb shell dumpsys activity activities | grep -A 25 -B 8 'com.aoe.canbusmonitor.turnsound' || true
