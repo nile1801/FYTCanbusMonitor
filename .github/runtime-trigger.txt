@@ -1,1 +1,1 @@
-Trigger Android 16 runtime smoke test.
+Trigger Android 16 runtime smoke test - corrected package.
