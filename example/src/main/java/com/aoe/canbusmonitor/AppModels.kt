@@ -199,6 +199,7 @@ class RuleEngine(private val onActiveChanged: (Boolean) -> Unit) {
 
 object RuntimeState {
     @Volatile var serviceRunning = false
+    @Volatile var fytPackagePresent = true
     @Volatile var fytConnected = false
     @Volatile var audioReady = false
     @Volatile var ruleActive = false
