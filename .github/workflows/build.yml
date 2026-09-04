@@ -1,6 +1,10 @@
 name: Build APK
 
 on:
+  push:
+    branches:
+      - main
+      - turn-sound
   workflow_dispatch:
     inputs:
       build_type:
@@ -34,32 +38,32 @@ jobs:
 
       - name: Create github.properties
         run: |
-          cat <<EOF > github.properties
+          cat <<EOF2 > github.properties
           gpr.usr=${{ secrets.GPR_USER }}
           gpr.key=${{ secrets.GPR_KEY }}
-          EOF
+          EOF2
 
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
       - name: Build debug APK
-        run: ./gradlew :example:assembleDebug --no-daemon
+        run: ./gradlew :example:assembleDebug --no-daemon --stacktrace
 
-      - name: Upload debug APK artifact (example)
+      - name: Upload debug APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: canbusmonitor-example-debug-apk
+          name: fyt-turn-sound-debug-apk
           path: example/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
       - name: Build unsigned release APK
         if: github.event_name == 'workflow_dispatch' && inputs.build_type == 'release-unsigned-and-debug'
-        run: ./gradlew :example:assembleRelease --no-daemon
+        run: ./gradlew :example:assembleRelease --no-daemon --stacktrace
 
-      - name: Upload unsigned release APK artifact (example)
+      - name: Upload unsigned release APK artifact
         if: github.event_name == 'workflow_dispatch' && inputs.build_type == 'release-unsigned-and-debug'
         uses: actions/upload-artifact@v4
         with:
-          name: canbusmonitor-example-release-unsigned-apk
+          name: fyt-turn-sound-release-unsigned-apk
           path: example/build/outputs/apk/release/*.apk
           if-no-files-found: error
