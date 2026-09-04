@@ -1,0 +1,1 @@
+Binary replacement will be committed as a Git blob/tree entry.
