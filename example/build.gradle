@@ -11,8 +11,8 @@ android {
         applicationId "com.aoe.canbusmonitor.turnsound"
         minSdk 33
         targetSdk 33
-        versionCode 2
-        versionName "1.1.0-turnsound"
+        versionCode 3
+        versionName "1.2.0-turnsound"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
