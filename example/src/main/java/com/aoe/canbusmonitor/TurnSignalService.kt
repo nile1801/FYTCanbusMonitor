@@ -47,6 +47,7 @@ class TurnSignalService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
 
+        // Khởi tạo AudioEngine ngay khi service chạy để SoundPool giải mã MP3 và giữ mẫu âm thanh trong RAM.
         audio = AudioEngine(this)
         ruleEngine = RuleEngine { active ->
             RuntimeState.ruleActive = active
@@ -59,8 +60,8 @@ class TurnSignalService : Service() {
         if (RuntimeState.fytPackagePresent) {
             connectToFyt()
         } else {
-            // Generic Android phone/tablet test mode. Keep UI + SoundPool working,
-            // but do not touch the FYT-only com.syu.ms service.
+            // Chế độ thử trên điện thoại/tablet Android thường: UI và âm thanh vẫn chạy,
+            // nhưng không đụng vào service FYT riêng của đầu xe là com.syu.ms.
             RuntimeState.fytConnected = false
             RuntimeState.lastError = null
             updateNotification()
@@ -93,7 +94,7 @@ class TurnSignalService : Service() {
         try {
             MsToolkitConnection.instance.connect(applicationContext)
         } catch (t: Throwable) {
-            RuntimeState.lastError = "FYT connect: ${t.javaClass.simpleName}: ${t.message}"
+            RuntimeState.lastError = "Kết nối FYT: ${t.javaClass.simpleName}: ${t.message}"
             updateNotification()
         }
     }
@@ -114,7 +115,6 @@ class TurnSignalService : Service() {
             ACTION_REFRESH -> refreshConfiguration()
             ACTION_TEST_SOUND -> {
                 audio.setVolume(SettingsStore.volume(this))
-                audio.setLoopGapMs(SettingsStore.loopGapMs(this))
                 audio.startTest()
             }
             ACTION_STOP_TEST -> audio.stopTest()
@@ -131,7 +131,6 @@ class TurnSignalService : Service() {
     private fun refreshConfiguration() {
         ruleEngine.setRules(RuleStore.load(this))
         audio.setVolume(SettingsStore.volume(this))
-        audio.setLoopGapMs(SettingsStore.loopGapMs(this))
         if (SettingsStore.isEnabled(this) && ruleEngine.active) {
             audio.setRuleActive(true)
         } else {
@@ -160,7 +159,7 @@ class TurnSignalService : Service() {
             getString(R.string.notification_channel_name),
             NotificationManager.IMPORTANCE_LOW
         ).apply {
-            description = "Keeps FYT CAN monitoring active in the background"
+            description = "Giữ dịch vụ giám sát FYT CAN chạy nền"
             setSound(null, null)
             enableVibration(false)
         }
@@ -176,10 +175,10 @@ class TurnSignalService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val status = when {
-            !RuntimeState.fytPackagePresent -> "Phone test mode • FYT service unavailable"
-            !RuntimeState.fytConnected -> "Waiting for FYT CAN service"
-            RuntimeState.ruleActive && SettingsStore.isEnabled(this) -> "CAN connected • turn sound active"
-            else -> "CAN connected • monitoring"
+            !RuntimeState.fytPackagePresent -> "Chế độ thử điện thoại • không có dịch vụ FYT"
+            !RuntimeState.fytConnected -> "Đang chờ dịch vụ FYT CAN"
+            RuntimeState.ruleActive && SettingsStore.isEnabled(this) -> "Đã kết nối CAN • âm xi nhan đang phát"
+            else -> "Đã kết nối CAN • đang giám sát"
         }
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_more)

@@ -34,7 +34,6 @@ class MainActivity : Activity() {
     private lateinit var volumeLabel: TextView
     private lateinit var soundEnabledSwitch: Switch
     private lateinit var volumeSeek: SeekBar
-    private lateinit var loopGapEdit: EditText
     private lateinit var monitorScroll: ScrollView
     private var lastMonitorVersion = -1L
     private var monitorPaused = false
@@ -50,14 +49,13 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Build the UI before starting services or opening a runtime-permission dialog.
-        // This also keeps generic Android phones usable as a UI/audio test device.
+        // Dựng giao diện trước khi khởi động service hoặc hiện hộp thoại quyền thông báo.
+        // Nhờ vậy app vẫn dùng được trên điện thoại Android thường để thử giao diện và âm thanh.
         setContentView(buildTabbedUi())
         renderRules()
         startTurnService()
 
-        // Ask only after the first frame is queued. A startup crash must never cause a
-        // permission-dialog loop, and we only ask once per install/session of app data.
+        // Chỉ hỏi quyền sau khi giao diện đã được tạo, tránh lặp hộp thoại nếu Activity bị tạo lại.
         handler.post { requestNotificationPermissionIfNeeded() }
     }
 
@@ -73,11 +71,7 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
-    /**
-     * Lightweight tab bar implemented with normal Buttons + FrameLayout.
-     * We intentionally do not use android.widget.TabHost: Android 16 can resolve its
-     * legacy label-indicator layout to resource id 0 for a programmatically-built host.
-     */
+    /** Thanh tab nhẹ dùng Button + FrameLayout để tránh phụ thuộc vào TabHost cũ. */
     private fun buildTabbedUi(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -114,8 +108,7 @@ class MainActivity : Activity() {
                         page.visibility = if (index == pageIndex) View.VISIBLE else View.GONE
                     }
                     buttons.forEachIndexed { index, tabButton ->
-                        // Disabled = selected. It gives a clear state without relying on
-                        // theme-specific colors that may differ on DUDUOS.
+                        // Nút bị vô hiệu hóa chính là tab đang được chọn.
                         tabButton.isEnabled = index != pageIndex
                     }
                     if (pageIndex == 1) renderRules()
@@ -129,9 +122,9 @@ class MainActivity : Activity() {
             tabBar.addView(button, weightParams())
         }
 
-        addTabButton("Monitor", 0)
-        addTabButton("Rules", 1)
-        addTabButton("Sound & Service", 2)
+        addTabButton("Giám sát", 0)
+        addTabButton("Luật CAN", 1)
+        addTabButton("Âm thanh & dịch vụ", 2)
 
         root.addView(
             tabBar,
@@ -156,7 +149,7 @@ class MainActivity : Activity() {
         return root
     }
 
-    /** First tab deliberately preserves the original app's plain scrolling event monitor. */
+    /** Tab đầu tiên vẫn giữ kiểu monitor cuộn đơn giản của app FYTCanbusMonitor gốc. */
     private fun buildMonitorTab(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -165,19 +158,19 @@ class MainActivity : Activity() {
 
         val controls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val clear = Button(this).apply {
-            text = "CLEAR"
+            text = "XÓA"
             setOnClickListener { MonitorStore.clear(); lastMonitorVersion = -1L; refreshMonitor() }
         }
         val pause = Button(this).apply {
-            text = "PAUSE"
+            text = "TẠM DỪNG"
             setOnClickListener {
                 monitorPaused = !monitorPaused
-                text = if (monitorPaused) "RESUME" else "PAUSE"
+                text = if (monitorPaused) "TIẾP TỤC" else "TẠM DỪNG"
                 if (!monitorPaused) lastMonitorVersion = -1L
             }
         }
         val export = Button(this).apply {
-            text = "EXPORT TXT"
+            text = "XUẤT TXT"
             setOnClickListener { exportMonitorLog() }
         }
         controls.addView(clear, weightParams())
@@ -186,17 +179,17 @@ class MainActivity : Activity() {
         root.addView(controls)
 
         latestCanText = TextView(this).apply {
-            text = "Latest CANBUS: waiting..."
+            text = "CANBUS mới nhất: đang chờ..."
             setPadding(0, dp(6), 0, dp(4))
         }
         root.addView(latestCanText)
 
         val useLatest = Button(this).apply {
-            text = "USE LATEST CAN EVENT AS RULE"
+            text = "DÙNG SỰ KIỆN CAN MỚI NHẤT LÀM LUẬT"
             setOnClickListener {
                 val event = MonitorStore.latestCanEvent
                 if (event?.ints?.isEmpty() != false) {
-                    toast("No CANBUS IntArray event available yet")
+                    toast("Chưa có sự kiện CANBUS IntArray để dùng")
                 } else {
                     showRuleDialog(null, event)
                 }
@@ -210,7 +203,7 @@ class MainActivity : Activity() {
             textSize = 13f
             setTextIsSelectable(true)
             setPadding(dp(4), dp(6), dp(4), dp(12))
-            text = "Waiting for FYT CAN data..."
+            text = "Đang chờ dữ liệu FYT CAN..."
         }
         monitorScroll.addView(
             monitorText,
@@ -237,12 +230,12 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(10), dp(12), dp(16))
         }
         root.addView(TextView(this).apply {
-            text = "Any enabled rule matching = PLAY. Sound stops only when the last matching rule becomes false. This safely handles LEFT + RIGHT together for hazard. If hazard uses a separate CAN index, add that index as another rule."
+            text = "Chỉ cần một luật đang bật khớp dữ liệu CAN là phát âm thanh. Âm thanh chỉ dừng khi không còn luật nào khớp. Cách này xử lý an toàn trường hợp đèn cảnh báo nguy hiểm làm cả trái và phải cùng hoạt động; nếu hazard có CAN index riêng thì thêm index đó thành một luật khác."
             textSize = 15f
             setPadding(0, 0, 0, dp(10))
         })
         root.addView(Button(this).apply {
-            text = "+ ADD RULE"
+            text = "+ THÊM LUẬT"
             setOnClickListener { showRuleDialog(null, null) }
         })
         rulesContainer = LinearLayout(this).apply {
@@ -267,7 +260,7 @@ class MainActivity : Activity() {
         root.addView(serviceStatusText)
 
         soundEnabledSwitch = Switch(this).apply {
-            text = "Turn signal sound enabled"
+            text = "Bật âm thanh xi nhan"
             isChecked = SettingsStore.isEnabled(this@MainActivity)
             setOnCheckedChangeListener { _, checked ->
                 SettingsStore.setEnabled(this@MainActivity, checked)
@@ -283,7 +276,7 @@ class MainActivity : Activity() {
             progress = (SettingsStore.volume(this@MainActivity) * 100f).toInt()
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                    volumeLabel.text = "Turn signal volume: $progress%"
+                    volumeLabel.text = "Âm lượng xi nhan: $progress%"
                     if (fromUser) SettingsStore.setVolume(this@MainActivity, progress / 100f)
                 }
 
@@ -294,108 +287,81 @@ class MainActivity : Activity() {
                 }
             })
         }
-        volumeLabel.text = "Turn signal volume: ${volumeSeek.progress}%"
+        volumeLabel.text = "Âm lượng xi nhan: ${volumeSeek.progress}%"
         root.addView(volumeSeek)
 
-        root.addView(TextView(this).apply {
-            text = "Sleep after each sound sample before playing it again (ms)"
-            setPadding(0, dp(14), 0, dp(4))
-        })
-        loopGapEdit = EditText(this).apply {
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
-            setText(SettingsStore.loopGapMs(this@MainActivity).toString())
-            hint = "0 - ${SettingsStore.MAX_LOOP_GAP_MS} ms"
-            setSelectAllOnFocus(true)
-        }
-        root.addView(loopGapEdit)
-        root.addView(TextView(this).apply {
-            text = "0 = no extra sleep. Maximum ${SettingsStore.MAX_LOOP_GAP_MS} ms. The delay is inserted after the 1.126 s sound sample, and stop remains immediate when the CAN rule turns off."
-            setPadding(0, 0, 0, dp(8))
-        })
-
         root.addView(Button(this).apply {
-            text = "APPLY / SAVE SOUND SETTINGS"
+            text = "ÁP DỤNG / LƯU CÀI ĐẶT"
             setOnClickListener { applySoundSettings(true) }
         })
 
         val testRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         testRow.addView(Button(this).apply {
-            text = "TEST SOUND"
+            text = "THỬ ÂM THANH"
             setOnClickListener {
-                if (applySoundSettings(false)) {
-                    sendServiceAction(TurnSignalService.ACTION_TEST_SOUND)
-                }
+                applySoundSettings(false)
+                sendServiceAction(TurnSignalService.ACTION_TEST_SOUND)
             }
         }, weightParams())
         testRow.addView(Button(this).apply {
-            text = "STOP TEST"
+            text = "DỪNG THỬ"
             setOnClickListener { sendServiceAction(TurnSignalService.ACTION_STOP_TEST) }
         }, weightParams())
         root.addView(testRow)
 
         root.addView(TextView(this).apply {
-            text = "Sound enabled, volume and loop sleep are stored in SharedPreferences. APPLY saves them, so rebooting the unit or reopening the app does not require configuring them again. TEST SOUND also applies the values currently shown above before testing."
+            text = "Trạng thái bật/tắt và âm lượng được lưu lại. Đóng app, mở lại hoặc khởi động lại đầu DUDU không cần cấu hình lại."
             setPadding(0, dp(10), 0, dp(6))
         })
 
         root.addView(TextView(this).apply {
-            text = "Audio is a short tick-tock sample cut from xinhan.mp3 and preloaded/decoded by SoundPool. The app does not request Audio Focus, so it is designed to mix over music instead of pausing or ducking it."
+            text = "File MP3 mới được SoundPool nạp và giải mã ngay khi service khởi tạo, sau đó giữ mẫu âm thanh trong RAM để phản hồi nhanh. Khi phát tới cuối file, SoundPool lặp lại từ đầu ngay lập tức, không chèn thời gian nghỉ. App không yêu cầu Audio Focus nên được thiết kế để trộn cùng nhạc/Vietmap/CarPlay thay vì chủ động dừng hoặc hạ âm lượng các nguồn khác."
             setPadding(0, dp(8), 0, dp(10))
         })
 
         root.addView(TextView(this).apply {
-            text = "AUTO START\n\nFull reboot: handled automatically by BOOT_COMPLETED + foreground service.\n\nDUDUOS 3.7 sleep/wake: create one Automatic Task:\nVehicle ignition → Open app → FYT Turn Sound - Background\n\nThe Background entry starts the service and closes immediately with a transparent Activity, so the configuration screen should not remain on top."
+            text = "TỰ KHỞI ĐỘNG\n\nKhởi động lại Android hoàn toàn: app tự xử lý bằng BOOT_COMPLETED + foreground service.\n\nDUDUOS 3.7 sleep/wake: tạo một Automatic Task:\nVehicle ignition → Open app → FYT Turn Sound - Chạy nền\n\nMục Chạy nền chỉ khởi động service rồi đóng Activity trong suốt ngay, vì vậy màn hình cấu hình không nằm đè lên giao diện DUDU."
             textSize = 15f
             setPadding(0, dp(8), 0, dp(8))
         })
 
         root.addView(Button(this).apply {
-            text = "START / REFRESH SERVICE"
+            text = "KHỞI ĐỘNG / LÀM MỚI DỊCH VỤ"
             setOnClickListener { startTurnService(); sendServiceAction(TurnSignalService.ACTION_REFRESH) }
         })
         scroll.addView(root)
         return scroll
     }
 
-    private fun applySoundSettings(showToast: Boolean): Boolean {
-        val gap = loopGapEdit.text.toString().trim().toIntOrNull()
-        if (gap == null || gap !in 0..SettingsStore.MAX_LOOP_GAP_MS) {
-            toast("Loop sleep must be 0-${SettingsStore.MAX_LOOP_GAP_MS} ms")
-            return false
-        }
-        SettingsStore.applySoundSettings(
-            this,
-            soundEnabledSwitch.isChecked,
-            volumeSeek.progress / 100f,
-            gap
-        )
+    private fun applySoundSettings(showToast: Boolean) {
+        SettingsStore.setEnabled(this, soundEnabledSwitch.isChecked)
+        SettingsStore.setVolume(this, volumeSeek.progress / 100f)
         sendServiceAction(TurnSignalService.ACTION_REFRESH)
-        if (showToast) toast("Sound settings saved")
-        return true
+        if (showToast) toast("Đã lưu cài đặt âm thanh")
     }
 
     private fun refreshMonitor() {
         val latest = MonitorStore.latestCanEvent
         latestCanText.text = if (latest == null) {
-            "Latest CANBUS: waiting..."
+            "CANBUS mới nhất: đang chờ..."
         } else {
-            "Latest CANBUS: ${latest.originalStyleLine()}"
+            "CANBUS mới nhất: ${latest.originalStyleLine()}"
         }
         if (monitorPaused || MonitorStore.version == lastMonitorVersion) return
         lastMonitorVersion = MonitorStore.version
         val text = MonitorStore.snapshot()
-        monitorText.text = if (text.isBlank()) "Waiting for FYT CAN data..." else text
+        monitorText.text = if (text.isBlank()) "Đang chờ dữ liệu FYT CAN..." else text
         monitorScroll.post { monitorScroll.fullScroll(View.FOCUS_DOWN) }
     }
 
     private fun refreshStatus() {
-        val error = RuntimeState.lastError?.let { "\nLast error: $it" } ?: ""
+        val error = RuntimeState.lastError?.let { "\nLỗi gần nhất: $it" } ?: ""
         serviceStatusText.text = buildString {
-            append("Service: ").append(if (RuntimeState.serviceRunning) "RUNNING" else "STOPPED")
-            append("\nFYT package: ").append(if (RuntimeState.fytPackagePresent) "AVAILABLE" else "NOT PRESENT (phone test mode)")
-            append("\nFYT com.syu.ms: ").append(if (RuntimeState.fytConnected) "CONNECTED" else "WAITING")
-            append("\nAudio sample: ").append(if (RuntimeState.audioReady) "READY" else "LOADING")
-            append("\nAny rule matched: ").append(if (RuntimeState.ruleActive) "YES" else "NO")
+            append("Dịch vụ: ").append(if (RuntimeState.serviceRunning) "ĐANG CHẠY" else "ĐÃ DỪNG")
+            append("\nGói FYT: ").append(if (RuntimeState.fytPackagePresent) "CÓ SẴN" else "KHÔNG CÓ - chế độ thử điện thoại")
+            append("\nFYT com.syu.ms: ").append(if (RuntimeState.fytConnected) "ĐÃ KẾT NỐI" else "ĐANG CHỜ")
+            append("\nMẫu âm thanh: ").append(if (RuntimeState.audioReady) "ĐÃ NẠP RAM" else "ĐANG NẠP")
+            append("\nCó luật đang khớp: ").append(if (RuntimeState.ruleActive) "CÓ" else "KHÔNG")
             append(error)
         }
     }
@@ -406,7 +372,7 @@ class MainActivity : Activity() {
         rulesContainer.removeAllViews()
         if (rules.isEmpty()) {
             rulesContainer.addView(TextView(this).apply {
-                text = "No rules yet. Trigger the turn signal in Monitor, then use the latest CAN event or add a rule manually."
+                text = "Chưa có luật. Hãy bật xi nhan trong tab Giám sát, sau đó dùng sự kiện CAN mới nhất hoặc thêm luật thủ công."
                 setPadding(0, dp(8), 0, dp(8))
             })
             return
@@ -430,11 +396,11 @@ class MainActivity : Activity() {
             card.addView(enabled)
             val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             row.addView(Button(this).apply {
-                text = "EDIT"
+                text = "SỬA"
                 setOnClickListener { showRuleDialog(rule, null) }
             }, weightParams())
             row.addView(Button(this).apply {
-                text = "DELETE"
+                text = "XÓA"
                 setOnClickListener {
                     val current = RuleStore.load(this@MainActivity).filterNot { it.id == rule.id }
                     RuleStore.save(this@MainActivity, current)
@@ -483,26 +449,26 @@ class MainActivity : Activity() {
         }
 
         val indexEdit = numberField("CANBUS index", base.index)
-        val positionEdit = numberField("IntArray position", base.position)
-        val valueEdit = numberField("Expected value", base.expectedValue)
+        val positionEdit = numberField("Vị trí trong IntArray", base.position)
+        val valueEdit = numberField("Giá trị cần khớp", base.expectedValue)
         val unsigned = CheckBox(this).apply {
-            text = "Compare as unsigned byte (actual & 0xFF)"
+            text = "So sánh dạng byte không dấu (giá trị thực & 0xFF)"
             isChecked = base.unsignedByte
         }
         root.addView(unsigned)
         event?.let {
             root.addView(TextView(this).apply {
-                text = "Captured: ${it.originalStyleLine()}"
+                text = "Dữ liệu bắt được: ${it.originalStyleLine()}"
                 typeface = Typeface.MONOSPACE
                 setPadding(0, dp(8), 0, 0)
             })
         }
 
         val dialog = AlertDialog.Builder(this)
-            .setTitle(if (existing == null) "Add CAN rule" else "Edit CAN rule")
+            .setTitle(if (existing == null) "Thêm luật CAN" else "Sửa luật CAN")
             .setView(root)
-            .setNegativeButton("CANCEL", null)
-            .setPositiveButton("SAVE", null)
+            .setNegativeButton("HỦY", null)
+            .setPositiveButton("LƯU", null)
             .create()
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
@@ -510,7 +476,7 @@ class MainActivity : Activity() {
                 val pos = positionEdit.text.toString().toIntOrNull()
                 val value = valueEdit.text.toString().toIntOrNull()
                 if (idx == null || pos == null || value == null || idx < 0 || pos < 0) {
-                    toast("Index, position and value must be valid numbers")
+                    toast("Index, vị trí và giá trị phải là số hợp lệ")
                     return@setOnClickListener
                 }
                 val rules = RuleStore.load(this)
@@ -534,7 +500,7 @@ class MainActivity : Activity() {
     private fun exportMonitorLog() {
         val log = MonitorStore.snapshot()
         if (log.isBlank()) {
-            toast("Monitor log is empty")
+            toast("Log giám sát đang trống")
             return
         }
         try {
@@ -544,13 +510,13 @@ class MainActivity : Activity() {
                 put(MediaStore.MediaColumns.RELATIVE_PATH, "Download")
             }
             val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: throw IllegalStateException("MediaStore insert returned null")
+                ?: throw IllegalStateException("MediaStore trả về null")
             contentResolver.openOutputStream(uri, "w")!!.use { out ->
                 out.write(log.toByteArray(Charsets.UTF_8))
             }
-            toast("Saved to Downloads")
+            toast("Đã lưu vào thư mục Download")
         } catch (t: Throwable) {
-            toast("Export failed: ${t.message}")
+            toast("Xuất log thất bại: ${t.message}")
         }
     }
 
@@ -558,7 +524,7 @@ class MainActivity : Activity() {
         try {
             startForegroundService(Intent(this, TurnSignalService::class.java))
         } catch (t: Throwable) {
-            RuntimeState.lastError = "Start service: ${t.javaClass.simpleName}: ${t.message}"
+            RuntimeState.lastError = "Khởi động dịch vụ: ${t.javaClass.simpleName}: ${t.message}"
         }
     }
 
@@ -568,7 +534,7 @@ class MainActivity : Activity() {
                 Intent(this, TurnSignalService::class.java).apply { this.action = action }
             )
         } catch (t: Throwable) {
-            RuntimeState.lastError = "Service action: ${t.javaClass.simpleName}: ${t.message}"
+            RuntimeState.lastError = "Lệnh dịch vụ: ${t.javaClass.simpleName}: ${t.message}"
         }
     }
 
@@ -579,8 +545,7 @@ class MainActivity : Activity() {
         val prefs = getSharedPreferences("turn_sound_ui", MODE_PRIVATE)
         if (prefs.getBoolean("notification_permission_requested", false)) return
 
-        // Store before opening the system dialog. Even if the Activity is unexpectedly
-        // recreated, we never generate a stack of duplicate permission dialogs.
+        // Ghi trạng thái trước khi mở hộp thoại hệ thống để không hỏi quyền lặp lại.
         prefs.edit().putBoolean("notification_permission_requested", true).apply()
         requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001)
     }
