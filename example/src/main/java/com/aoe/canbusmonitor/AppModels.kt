@@ -140,6 +140,8 @@ object SettingsStore {
     private const val PREFS = "turn_sound_settings"
     private const val ENABLED = "enabled"
     private const val VOLUME = "volume"
+    private const val LOOP_GAP_MS = "loop_gap_ms"
+    const val MAX_LOOP_GAP_MS = 10_000
 
     fun isEnabled(context: Context): Boolean =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(ENABLED, true)
@@ -153,6 +155,27 @@ object SettingsStore {
 
     fun setVolume(context: Context, value: Float) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putFloat(VOLUME, value.coerceIn(0f, 1f)).apply()
+    }
+
+    fun loopGapMs(context: Context): Int =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getInt(LOOP_GAP_MS, 0)
+            .coerceIn(0, MAX_LOOP_GAP_MS)
+
+    fun setLoopGapMs(context: Context, value: Int) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(LOOP_GAP_MS, value.coerceIn(0, MAX_LOOP_GAP_MS))
+            .apply()
+    }
+
+    fun applySoundSettings(context: Context, enabled: Boolean, volume: Float, loopGapMs: Int) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(ENABLED, enabled)
+            .putFloat(VOLUME, volume.coerceIn(0f, 1f))
+            .putInt(LOOP_GAP_MS, loopGapMs.coerceIn(0, MAX_LOOP_GAP_MS))
+            .apply()
     }
 }
 
