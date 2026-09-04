@@ -20,9 +20,13 @@ jobs:
           ref: new-blinker-audio-vietnamese-ui
           fetch-depth: 0
 
-      - name: Rebuild MP3 from staged chunks
+      - name: Validate and rebuild MP3 from staged chunks
         shell: bash
         run: |
+          for f in .tmp-blinker/chunk*.b64; do
+            echo "Checking $f ($(stat -c%s "$f") bytes)"
+            base64 -d "$f" >/dev/null
+          done
           cat .tmp-blinker/chunk*.b64 | base64 -d > example/src/main/res/raw/turn_signal.mp3
           echo "7dd620192b7cd79aa5cb85014ee50bebdef40402658b0eb84aa8dfa19b658d42  example/src/main/res/raw/turn_signal.mp3" | sha256sum -c -
           test "$(stat -c%s example/src/main/res/raw/turn_signal.mp3)" = "91374"
