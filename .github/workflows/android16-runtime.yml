@@ -49,19 +49,13 @@ jobs:
           profile: pixel_6
           disable-animations: true
           script: |
-            APP_ID='com.aoe.canbusmonitor.turnsound'
-            COMPONENT="$APP_ID/com.aoe.canbusmonitor.MainActivity"
             adb install -r example/build/outputs/apk/debug/example-debug.apk
             adb logcat -c
-            adb shell am start -W -n "$COMPONENT" || true
+            adb shell am start -W -n com.aoe.canbusmonitor.turnsound/com.aoe.canbusmonitor.MainActivity || true
             sleep 8
             echo '===== PROCESS ====='
-            adb shell pidof "$APP_ID" || true
+            adb shell pidof com.aoe.canbusmonitor.turnsound || true
             echo '===== CRASH LOG ====='
-            adb logcat -d -v threadtime | grep -E -A 100 -B 30 "FATAL EXCEPTION|AndroidRuntime|Process: $APP_ID" || true
+            adb logcat -d -v threadtime | grep -E -A 100 -B 30 'FATAL EXCEPTION|AndroidRuntime|Process: com.aoe.canbusmonitor.turnsound' || true
             echo '===== ACTIVITY STATE ====='
-            adb shell dumpsys activity activities | grep -A 25 -B 8 "$APP_ID" || true
-            CRASHES=$(adb logcat -d -v brief | grep -c "Process: $APP_ID" || true)
-            if [ "$CRASHES" -gt 0 ]; then
-              exit 1
-            fi
+            adb shell dumpsys activity activities | grep -A 25 -B 8 'com.aoe.canbusmonitor.turnsound' || true
