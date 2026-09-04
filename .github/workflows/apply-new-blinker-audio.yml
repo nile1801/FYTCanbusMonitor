@@ -1,4 +1,4 @@
-name: Chẩn đoán dữ liệu âm thanh xi nhan
+name: Tạo file âm thanh xi nhan chính xác
 
 on:
   push:
@@ -8,38 +8,80 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnose:
+  create-audio:
     runs-on: ubuntu-latest
     steps:
       - name: Lấy mã nguồn nhánh tạm
         uses: actions/checkout@v4
         with:
           ref: new-blinker-audio-vietnamese-ui
+          fetch-depth: 0
 
-      - name: Kiểm tra từng mảnh Base64
+      - name: Khôi phục và kiểm tra file MP3
         shell: python
         run: |
           import base64
           import glob
           import hashlib
-          import re
+          from pathlib import Path
 
-          parts = []
-          for path in sorted(glob.glob('.tmp-blinker/chunk*.b64')):
-              text = open(path, encoding='utf-8').read().replace('\r', '').replace('\n', '')
-              bad = ''.join(sorted(set(re.sub(r'[A-Za-z0-9+/=]', '', text))))
-              print(f'{path} bytes={len(text)} mod4={len(text) % 4} first={text[:12]} last={text[-12:]} invalid={bad!r}')
-              parts.append(text)
+          def git_blob_sha(text: str) -> str:
+              data = text.encode('ascii')
+              header = f'blob {len(data)}\0'.encode('ascii')
+              return hashlib.sha1(header + data).hexdigest()
+
+          paths = sorted(glob.glob('.tmp-blinker/chunk*.b64'))
+          parts = [Path(path).read_text(encoding='utf-8').replace('\r', '').replace('\n', '') for path in paths]
+
+          # Mảnh 07 bị thiếu đúng một ký tự. Thử vị trí/ký tự và đối chiếu Git SHA.
+          current = parts[7]
+          expected_sha = '56935aa945bb0a067ce2d14296189826d8966708'
+          alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+          repaired = None
+          for position in range(len(current) + 1):
+              prefix = current[:position]
+              suffix = current[position:]
+              for char in alphabet:
+                  candidate = prefix + char + suffix
+                  if git_blob_sha(candidate) == expected_sha:
+                      repaired = candidate
+                      print(f'Đã sửa chunk07: chèn {char!r} tại vị trí {position}')
+                      break
+              if repaired is not None:
+                  break
+          if repaired is None:
+              raise RuntimeError('Không khôi phục được chunk07')
+          parts[7] = repaired
+
+          # Mảnh 10 chỉ thiếu 54 ký tự q ở phần đệm cuối file.
+          parts[10] = parts[10] + ('q' * 54)
+          if git_blob_sha(parts[10]) != '4d05d5eeca409113b46df5b98aeac8c41e22cad7':
+              raise RuntimeError('chunk10 không khớp Git SHA mong đợi')
 
           merged = ''.join(parts)
-          print(f'TOTAL bytes={len(merged)} mod4={len(merged) % 4}')
-          try:
-              audio = base64.b64decode(merged, validate=True)
-              print(f'DECODED_SIZE={len(audio)}')
-              print(f'SHA256={hashlib.sha256(audio).hexdigest()}')
-          except Exception as exc:
-              print(f'DECODE_ERROR={type(exc).__name__}: {exc}')
-          raise SystemExit(1)
+          if len(merged) != 121832:
+              raise RuntimeError(f'Độ dài Base64 sai: {len(merged)}')
+
+          audio = base64.b64decode(merged, validate=True)
+          digest = hashlib.sha256(audio).hexdigest()
+          if len(audio) != 91374:
+              raise RuntimeError(f'Kích thước MP3 sai: {len(audio)}')
+          if digest != '7dd620192b7cd79aa5cb85014ee50bebdef40402658b0eb84aa8dfa19b658d42':
+              raise RuntimeError(f'SHA-256 MP3 sai: {digest}')
+
+          output = Path('example/src/main/res/raw/turn_signal.mp3')
+          output.parent.mkdir(parents=True, exist_ok=True)
+          output.write_bytes(audio)
+          print(f'Đã tạo {output}: {len(audio)} byte, SHA-256={digest}')
+
+      - name: Lưu file MP3 vào nhánh tạm
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add example/src/main/res/raw/turn_signal.mp3
+          git commit -m "Thay âm thanh xi nhan bằng đúng file MP3 mới" || exit 0
+          git push origin HEAD:new-blinker-audio-vietnamese-ui
