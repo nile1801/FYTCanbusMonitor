@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.IBinder
 import com.aoe.fytcanbusmonitor.ConnectionObserver
 import com.aoe.fytcanbusmonitor.IRemoteToolkit
@@ -23,6 +24,7 @@ class TurnSignalService : Service() {
     private val statusObserver = object : ConnectionObserver {
         override fun onConnected(toolkit: IRemoteToolkit?) {
             RuntimeState.fytConnected = toolkit != null
+            RuntimeState.lastError = null
             updateNotification()
         }
 
@@ -40,6 +42,8 @@ class TurnSignalService : Service() {
     override fun onCreate() {
         super.onCreate()
         RuntimeState.serviceRunning = true
+        RuntimeState.fytPackagePresent = isFytPackageAvailable()
+
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
 
@@ -52,6 +56,18 @@ class TurnSignalService : Service() {
         }
         ruleEngine.setRules(RuleStore.load(this))
 
+        if (RuntimeState.fytPackagePresent) {
+            connectToFyt()
+        } else {
+            // Generic Android phone/tablet test mode. Keep UI + SoundPool working,
+            // but do not touch the FYT-only com.syu.ms service.
+            RuntimeState.fytConnected = false
+            RuntimeState.lastError = null
+            updateNotification()
+        }
+    }
+
+    private fun connectToFyt() {
         val mainCallback = FytModuleCallback("MAIN") { }
         val btCallback = FytModuleCallback("BT") { }
         val canCallback = FytModuleCallback("CANBUS") { event -> ruleEngine.onCanEvent(event) }
@@ -74,7 +90,23 @@ class TurnSignalService : Service() {
         )
 
         observers.forEach { MsToolkitConnection.instance.addObserver(it) }
-        MsToolkitConnection.instance.connect(applicationContext)
+        try {
+            MsToolkitConnection.instance.connect(applicationContext)
+        } catch (t: Throwable) {
+            RuntimeState.lastError = "FYT connect: ${t.javaClass.simpleName}: ${t.message}"
+            updateNotification()
+        }
+    }
+
+    private fun isFytPackageAvailable(): Boolean {
+        return try {
+            packageManager.getPackageInfo("com.syu.ms", 0)
+            true
+        } catch (_: PackageManager.NameNotFoundException) {
+            false
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -110,7 +142,7 @@ class TurnSignalService : Service() {
         destroying = true
         observers.forEach { MsToolkitConnection.instance.removeObserver(it) }
         observers.clear()
-        audio.release()
+        if (::audio.isInitialized) audio.release()
         RuntimeState.serviceRunning = false
         RuntimeState.fytConnected = false
         RuntimeState.ruleActive = false
@@ -142,6 +174,7 @@ class TurnSignalService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val status = when {
+            !RuntimeState.fytPackagePresent -> "Phone test mode • FYT service unavailable"
             !RuntimeState.fytConnected -> "Waiting for FYT CAN service"
             RuntimeState.ruleActive && SettingsStore.isEnabled(this) -> "CAN connected • turn sound active"
             else -> "CAN connected • monitoring"

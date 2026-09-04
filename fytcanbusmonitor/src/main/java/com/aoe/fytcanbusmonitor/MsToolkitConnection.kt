@@ -10,7 +10,6 @@ import android.os.IBinder
 import android.os.Looper
 import java.util.*
 
-
 class MsToolkitConnection private constructor() : ServiceConnection {
     private var mConnecting = false
     private var mContext: Context? = null
@@ -19,16 +18,26 @@ class MsToolkitConnection private constructor() : ServiceConnection {
     private val mHandler: Handler = Handler(Looper.getMainLooper())
     private val mConnectionObservers: ArrayList<ConnectionObserver> = ArrayList()
     private val mRunnableConnect: Runnable = object : Runnable {
-        // from class: com.syu.module.MsToolkitConnection.1
-        // java.lang.Runnable
         override fun run() {
             if (remoteToolkit != null) {
                 mConnecting = false
                 return
             }
-            val intent = Intent("com.syu.ms.toolkit")
-            intent.component = ComponentName("com.syu.ms", "app.ToolkitService")
-            mContext?.bindService(intent, instance, 1)
+
+            val intent = Intent("com.syu.ms.toolkit").apply {
+                component = ComponentName("com.syu.ms", "app.ToolkitService")
+            }
+
+            try {
+                // Some non-FYT Android builds throw instead of simply returning false when
+                // the explicit service component does not exist or cannot be bound.
+                mContext?.bindService(intent, instance, Context.BIND_AUTO_CREATE)
+            } catch (_: SecurityException) {
+                // Keep retry semantics for FYT boot races without crashing the host app.
+            } catch (_: IllegalArgumentException) {
+            } catch (_: Throwable) {
+            }
+
             mHandler.postDelayed(this, Random().nextInt(3000) + 1000L)
         }
     }
@@ -91,8 +100,7 @@ class MsToolkitConnection private constructor() : ServiceConnection {
         mConnectionObservers.clear()
     }
 
-
-    @Synchronized  // android.content.ServiceConnection
+    @Synchronized
     override fun onServiceConnected(name: ComponentName, service: IBinder) {
         remoteToolkit = IRemoteToolkit.Stub.asInterface(service)
         val it: Iterator<ConnectionObserver> = mConnectionObservers.iterator()
@@ -102,7 +110,7 @@ class MsToolkitConnection private constructor() : ServiceConnection {
         }
     }
 
-    @Synchronized  // android.content.ServiceConnection
+    @Synchronized
     override fun onServiceDisconnected(name: ComponentName) {
         remoteToolkit = null
         val it: Iterator<ConnectionObserver> = mConnectionObservers.iterator()
@@ -110,22 +118,27 @@ class MsToolkitConnection private constructor() : ServiceConnection {
             val observer: ConnectionObserver = it.next()
             mHandler.post(OnServiceDisconnected(this, observer, null))
         }
+        mConnecting = false
         connect(mContext, Random().nextInt(3000) + 1000L)
     }
 
-    /* JADX INFO: Access modifiers changed from: private */ /* loaded from: classes.dex */
+    override fun onBindingDied(name: ComponentName) {
+        onServiceDisconnected(name)
+    }
+
+    override fun onNullBinding(name: ComponentName) {
+        onServiceDisconnected(name)
+    }
+
     inner class OnServiceConnected private constructor(observer: ConnectionObserver) : Runnable {
         private val observer: ConnectionObserver?
 
-        // synthetic
         internal constructor(
             msToolkitConnection: MsToolkitConnection?,
             connectionObserver: ConnectionObserver,
             onServiceConnected: OnServiceConnected?
-        ) : this(connectionObserver) {
-        }
+        ) : this(connectionObserver)
 
-        // java.lang.Runnable
         override fun run() {
             val toolkit = remoteToolkit
             if (toolkit != null && observer != null) {
@@ -138,25 +151,17 @@ class MsToolkitConnection private constructor() : ServiceConnection {
         }
     }
 
-    /* loaded from: classes.dex */
-    private inner class OnServiceDisconnected private constructor(observer: ConnectionObserver?) :
-
-        Runnable {
+    private inner class OnServiceDisconnected private constructor(observer: ConnectionObserver?) : Runnable {
         private val observer: ConnectionObserver?
 
-        // synthetic
         internal constructor(
             msToolkitConnection: MsToolkitConnection?,
             connectionObserver: ConnectionObserver?,
             onServiceDisconnected: OnServiceDisconnected?
-        ) : this(connectionObserver) {
-        }
+        ) : this(connectionObserver)
 
-        // java.lang.Runnable
         override fun run() {
-            if (observer != null) {
-                observer.onDisconnected()
-            }
+            observer?.onDisconnected()
         }
 
         init {
