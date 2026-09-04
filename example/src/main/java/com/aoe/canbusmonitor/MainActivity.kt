@@ -12,7 +12,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
-import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -23,8 +22,6 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
-import android.widget.TabHost
-import android.widget.TabWidget
 import android.widget.TextView
 import android.widget.Toast
 
@@ -51,10 +48,16 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestNotificationPermissionIfNeeded()
-        startTurnService()
+
+        // Build the UI before starting services or opening a runtime-permission dialog.
+        // This also keeps generic Android phones usable as a UI/audio test device.
         setContentView(buildTabbedUi())
         renderRules()
+        startTurnService()
+
+        // Ask only after the first frame is queued. A startup crash must never cause a
+        // permission-dialog loop, and we only ask once per install/session of app data.
+        handler.post { requestNotificationPermissionIfNeeded() }
     }
 
     override fun onResume() {
@@ -69,27 +72,87 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
+    /**
+     * Lightweight tab bar implemented with normal Buttons + FrameLayout.
+     * We intentionally do not use android.widget.TabHost: Android 16 can resolve its
+     * legacy label-indicator layout to resource id 0 for a programmatically-built host.
+     */
     private fun buildTabbedUi(): View {
-        val tabHost = TabHost(this).apply { id = android.R.id.tabhost }
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val tabWidget = TabWidget(this).apply { id = android.R.id.tabs }
-        val content = FrameLayout(this).apply { id = android.R.id.tabcontent }
-        root.addView(tabWidget, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(content, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        tabHost.addView(root)
-        tabHost.setup()
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
 
-        val monitor = buildMonitorTab().apply { id = View.generateViewId() }
-        val rules = buildRulesTab().apply { id = View.generateViewId() }
-        val sound = buildSoundTab().apply { id = View.generateViewId() }
-        content.addView(monitor)
-        content.addView(rules)
-        content.addView(sound)
+        val tabBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+        }
+        val content = FrameLayout(this)
 
-        tabHost.addTab(tabHost.newTabSpec("monitor").setIndicator("Monitor").setContent(monitor.id))
-        tabHost.addTab(tabHost.newTabSpec("rules").setIndicator("Rules").setContent(rules.id))
-        tabHost.addTab(tabHost.newTabSpec("sound").setIndicator("Sound & Service").setContent(sound.id))
-        return tabHost
+        val monitor = buildMonitorTab()
+        val rules = buildRulesTab()
+        val sound = buildSoundTab()
+        val pages = listOf(monitor, rules, sound)
+
+        pages.forEach { page ->
+            content.addView(
+                page,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            )
+        }
+
+        val buttons = arrayListOf<Button>()
+        fun addTabButton(label: String, pageIndex: Int) {
+            val button = Button(this).apply {
+                text = label
+                isAllCaps = false
+                setOnClickListener {
+                    pages.forEachIndexed { index, page ->
+                        page.visibility = if (index == pageIndex) View.VISIBLE else View.GONE
+                    }
+                    buttons.forEachIndexed { index, tabButton ->
+                        // Disabled = selected. It gives a clear state without relying on
+                        // theme-specific colors that may differ on DUDUOS.
+                        tabButton.isEnabled = index != pageIndex
+                    }
+                    if (pageIndex == 1) renderRules()
+                    if (pageIndex == 0) {
+                        lastMonitorVersion = -1L
+                        refreshMonitor()
+                    }
+                }
+            }
+            buttons += button
+            tabBar.addView(button, weightParams())
+        }
+
+        addTabButton("Monitor", 0)
+        addTabButton("Rules", 1)
+        addTabButton("Sound & Service", 2)
+
+        root.addView(
+            tabBar,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+        root.addView(
+            content,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        )
+
+        pages.forEachIndexed { index, page ->
+            page.visibility = if (index == 0) View.VISIBLE else View.GONE
+        }
+        buttons.forEachIndexed { index, button -> button.isEnabled = index != 0 }
+        return root
     }
 
     /** First tab deliberately preserves the original app's plain scrolling event monitor. */
@@ -148,8 +211,21 @@ class MainActivity : Activity() {
             setPadding(dp(4), dp(6), dp(4), dp(12))
             text = "Waiting for FYT CAN data..."
         }
-        monitorScroll.addView(monitorText, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(monitorScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        monitorScroll.addView(
+            monitorText,
+            ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+        root.addView(
+            monitorScroll,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        )
         return root
     }
 
@@ -209,7 +285,9 @@ class MainActivity : Activity() {
                     volumeLabel.text = "Turn signal volume: $progress%"
                     if (fromUser) SettingsStore.setVolume(this@MainActivity, progress / 100f)
                 }
+
                 override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
                 override fun onStopTrackingTouch(seekBar: SeekBar?) {
                     sendServiceAction(TurnSignalService.ACTION_REFRESH)
                 }
@@ -266,6 +344,7 @@ class MainActivity : Activity() {
         val error = RuntimeState.lastError?.let { "\nLast error: $it" } ?: ""
         serviceStatusText.text = buildString {
             append("Service: ").append(if (RuntimeState.serviceRunning) "RUNNING" else "STOPPED")
+            append("\nFYT package: ").append(if (RuntimeState.fytPackagePresent) "AVAILABLE" else "NOT PRESENT (phone test mode)")
             append("\nFYT com.syu.ms: ").append(if (RuntimeState.fytConnected) "CONNECTED" else "WAITING")
             append("\nAudio sample: ").append(if (RuntimeState.audioReady) "READY" else "LOADING")
             append("\nAny rule matched: ").append(if (RuntimeState.ruleActive) "YES" else "NO")
@@ -316,9 +395,13 @@ class MainActivity : Activity() {
                 }
             }, weightParams())
             card.addView(row)
-            rulesContainer.addView(card, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(8)
-            })
+            rulesContainer.addView(
+                card,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(8) }
+            )
         }
     }
 
@@ -337,10 +420,12 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(8), dp(20), dp(4))
         }
+
         fun numberField(label: String, value: Int): EditText {
             val edit = EditText(this).apply {
                 hint = label
-                inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_SIGNED
+                inputType = android.text.InputType.TYPE_CLASS_NUMBER or
+                    android.text.InputType.TYPE_NUMBER_FLAG_SIGNED
                 setText(value.toString())
                 selectAll()
             }
@@ -381,7 +466,12 @@ class MainActivity : Activity() {
                     return@setOnClickListener
                 }
                 val rules = RuleStore.load(this)
-                val updated = base.copy(index = idx, position = pos, expectedValue = value, unsignedByte = unsigned.isChecked)
+                val updated = base.copy(
+                    index = idx,
+                    position = pos,
+                    expectedValue = value,
+                    unsignedByte = unsigned.isChecked
+                )
                 val oldIndex = rules.indexOfFirst { it.id == updated.id }
                 if (oldIndex >= 0) rules[oldIndex] = updated else rules.add(updated)
                 RuleStore.save(this, rules)
@@ -426,16 +516,25 @@ class MainActivity : Activity() {
 
     private fun sendServiceAction(action: String) {
         try {
-            startForegroundService(Intent(this, TurnSignalService::class.java).apply { this.action = action })
+            startForegroundService(
+                Intent(this, TurnSignalService::class.java).apply { this.action = action }
+            )
         } catch (t: Throwable) {
             RuntimeState.lastError = "Service action: ${t.javaClass.simpleName}: ${t.message}"
         }
     }
 
     private fun requestNotificationPermissionIfNeeded() {
-        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001)
-        }
+        if (Build.VERSION.SDK_INT < 33) return
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return
+
+        val prefs = getSharedPreferences("turn_sound_ui", MODE_PRIVATE)
+        if (prefs.getBoolean("notification_permission_requested", false)) return
+
+        // Store before opening the system dialog. Even if the Activity is unexpectedly
+        // recreated, we never generate a stack of duplicate permission dialogs.
+        prefs.edit().putBoolean("notification_permission_requested", true).apply()
+        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001)
     }
 
     private fun weightParams(): LinearLayout.LayoutParams =
