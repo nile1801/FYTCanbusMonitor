@@ -131,7 +131,7 @@ class MainActivity : Activity() {
             text = "USE LATEST CAN EVENT AS RULE"
             setOnClickListener {
                 val event = MonitorStore.latestCanEvent
-                if (event?.ints.isNullOrEmpty()) {
+                if (event?.ints?.isEmpty() != false) {
                     toast("No CANBUS IntArray event available yet")
                 } else {
                     showRuleDialog(null, event)
@@ -148,7 +148,7 @@ class MainActivity : Activity() {
             setPadding(dp(4), dp(6), dp(4), dp(12))
             text = "Waiting for FYT CAN data..."
         }
-        monitorScroll.addView(monitorText, ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        monitorScroll.addView(monitorText, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         root.addView(monitorScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         return root
     }
