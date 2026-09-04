@@ -34,6 +34,7 @@ class MainActivity : Activity() {
     private lateinit var volumeLabel: TextView
     private lateinit var soundEnabledSwitch: Switch
     private lateinit var volumeSeek: SeekBar
+    private lateinit var loopGapEdit: EditText
     private lateinit var monitorScroll: ScrollView
     private var lastMonitorVersion = -1L
     private var monitorPaused = false
@@ -296,10 +297,35 @@ class MainActivity : Activity() {
         volumeLabel.text = "Turn signal volume: ${volumeSeek.progress}%"
         root.addView(volumeSeek)
 
+        root.addView(TextView(this).apply {
+            text = "Sleep after each sound sample before playing it again (ms)"
+            setPadding(0, dp(14), 0, dp(4))
+        })
+        loopGapEdit = EditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            setText(SettingsStore.loopGapMs(this@MainActivity).toString())
+            hint = "0 - ${SettingsStore.MAX_LOOP_GAP_MS} ms"
+            setSelectAllOnFocus(true)
+        }
+        root.addView(loopGapEdit)
+        root.addView(TextView(this).apply {
+            text = "0 = no extra sleep. Maximum ${SettingsStore.MAX_LOOP_GAP_MS} ms. The delay is inserted after the 1.126 s sound sample, and stop remains immediate when the CAN rule turns off."
+            setPadding(0, 0, 0, dp(8))
+        })
+
+        root.addView(Button(this).apply {
+            text = "APPLY / SAVE SOUND SETTINGS"
+            setOnClickListener { applySoundSettings(true) }
+        })
+
         val testRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         testRow.addView(Button(this).apply {
             text = "TEST SOUND"
-            setOnClickListener { sendServiceAction(TurnSignalService.ACTION_TEST_SOUND) }
+            setOnClickListener {
+                if (applySoundSettings(false)) {
+                    sendServiceAction(TurnSignalService.ACTION_TEST_SOUND)
+                }
+            }
         }, weightParams())
         testRow.addView(Button(this).apply {
             text = "STOP TEST"
@@ -308,8 +334,13 @@ class MainActivity : Activity() {
         root.addView(testRow)
 
         root.addView(TextView(this).apply {
+            text = "Sound enabled, volume and loop sleep are stored in SharedPreferences. APPLY saves them, so rebooting the unit or reopening the app does not require configuring them again. TEST SOUND also applies the values currently shown above before testing."
+            setPadding(0, dp(10), 0, dp(6))
+        })
+
+        root.addView(TextView(this).apply {
             text = "Audio is a short tick-tock sample cut from xinhan.mp3 and preloaded/decoded by SoundPool. The app does not request Audio Focus, so it is designed to mix over music instead of pausing or ducking it."
-            setPadding(0, dp(14), 0, dp(10))
+            setPadding(0, dp(8), 0, dp(10))
         })
 
         root.addView(TextView(this).apply {
@@ -324,6 +355,23 @@ class MainActivity : Activity() {
         })
         scroll.addView(root)
         return scroll
+    }
+
+    private fun applySoundSettings(showToast: Boolean): Boolean {
+        val gap = loopGapEdit.text.toString().trim().toIntOrNull()
+        if (gap == null || gap !in 0..SettingsStore.MAX_LOOP_GAP_MS) {
+            toast("Loop sleep must be 0-${SettingsStore.MAX_LOOP_GAP_MS} ms")
+            return false
+        }
+        SettingsStore.applySoundSettings(
+            this,
+            soundEnabledSwitch.isChecked,
+            volumeSeek.progress / 100f,
+            gap
+        )
+        sendServiceAction(TurnSignalService.ACTION_REFRESH)
+        if (showToast) toast("Sound settings saved")
+        return true
     }
 
     private fun refreshMonitor() {
