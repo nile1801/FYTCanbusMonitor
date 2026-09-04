@@ -38,7 +38,7 @@ jobs:
 
           # Mảnh 07 bị thiếu đúng một ký tự. Thử vị trí/ký tự và đối chiếu Git SHA.
           current = parts[7]
-          expected_sha = '56935aa945bb0a067ce2d14296189826d8966708'
+          expected_sha = '56935ed7fb0d6447f56caeb85fc237223f484812'
           alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
           repaired = None
           for position in range(len(current) + 1):
