@@ -33,33 +33,71 @@ jobs:
               header = f'blob {len(data)}\0'.encode('ascii')
               return hashlib.sha1(header + data).hexdigest()
 
+          def repair_one_insertion(current: str, expected_sha: str, label: str) -> str:
+              alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+              for position in range(len(current) + 1):
+                  prefix = current[:position]
+                  suffix = current[position:]
+                  for char in alphabet:
+                      candidate = prefix + char + suffix
+                      if git_blob_sha(candidate) == expected_sha:
+                          print(f'Đã sửa {label}: chèn {char!r} tại vị trí {position}')
+                          return candidate
+              raise RuntimeError(f'Không khôi phục được {label}')
+
+          def repair_one_substitution(current: str, expected_sha: str, label: str) -> str:
+              alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+              for position, old_char in enumerate(current):
+                  prefix = current[:position]
+                  suffix = current[position + 1:]
+                  for char in alphabet:
+                      if char == old_char:
+                          continue
+                      candidate = prefix + char + suffix
+                      if git_blob_sha(candidate) == expected_sha:
+                          print(f'Đã sửa {label}: đổi {old_char!r} thành {char!r} tại vị trí {position}')
+                          return candidate
+              raise RuntimeError(f'Không khôi phục được {label}')
+
           paths = sorted(glob.glob('.tmp-blinker/chunk*.b64'))
           parts = [Path(path).read_text(encoding='utf-8').replace('\r', '').replace('\n', '') for path in paths]
 
-          # Mảnh 07 bị thiếu đúng một ký tự. Thử vị trí/ký tự và đối chiếu Git SHA.
-          current = parts[7]
-          expected_sha = '56935ed7fb0d6447f56caeb85fc237223f484812'
-          alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-          repaired = None
-          for position in range(len(current) + 1):
-              prefix = current[:position]
-              suffix = current[position:]
-              for char in alphabet:
-                  candidate = prefix + char + suffix
-                  if git_blob_sha(candidate) == expected_sha:
-                      repaired = candidate
-                      print(f'Đã sửa chunk07: chèn {char!r} tại vị trí {position}')
-                      break
-              if repaired is not None:
-                  break
-          if repaired is None:
-              raise RuntimeError('Không khôi phục được chunk07')
-          parts[7] = repaired
+          # Mảnh 07 thiếu đúng một ký tự.
+          parts[7] = repair_one_insertion(
+              parts[7],
+              '56935ed7fb0d6447f56caeb85fc237223f484812',
+              'chunk07',
+          )
+
+          # Mảnh 09 dài đúng nhưng sai đúng một ký tự.
+          parts[9] = repair_one_substitution(
+              parts[9],
+              '7dfb3748f48e4bc698ef69d2dbed1c5bbe787b72',
+              'chunk09',
+          )
 
           # Mảnh 10 chỉ thiếu 54 ký tự q ở phần đệm cuối file.
           parts[10] = parts[10] + ('q' * 54)
           if git_blob_sha(parts[10]) != '4d05d5eeca409113b46df5b98aeac8c41e22cad7':
               raise RuntimeError('chunk10 không khớp Git SHA mong đợi')
+
+          expected_shas = [
+              '9c65488d729a894a155742585e6d4d850a9f86c8',
+              '40f85e37b18f26cc36c532a991300ae7c4234ac6',
+              'e0ea038d9e6b8dfa429beb7dfe2d3ad32db9f918',
+              '78897ffc38af1517061b238e2713aa5d1002e74c',
+              '1bf869bb9a8682022c262daaec2e98b69afc1fc5',
+              '46c3966c1463d8350da9227ec9b0b302501f7c49',
+              '8c0a10d965dde461d832b55a802ac4ca1af4d9c7',
+              '56935ed7fb0d6447f56caeb85fc237223f484812',
+              '8ff7bb8338c18bc1e137b32a9c43ae7e269f67d9',
+              '7dfb3748f48e4bc698ef69d2dbed1c5bbe787b72',
+              '4d05d5eeca409113b46df5b98aeac8c41e22cad7',
+          ]
+          for index, (part, expected_sha) in enumerate(zip(parts, expected_shas)):
+              actual_sha = git_blob_sha(part)
+              if actual_sha != expected_sha:
+                  raise RuntimeError(f'chunk{index:02d} sai SHA: {actual_sha}')
 
           merged = ''.join(parts)
           if len(merged) != 121832:
