@@ -1,3 +1,5 @@
 <resources>
-    <string name="app_name">CanbusMonitor</string>
+    <string name="app_name">FYT CANBUS Monitor+</string>
+    <string name="background_name">FYT Turn Sound - Background</string>
+    <string name="notification_channel_name">FYT Turn Sound</string>
 </resources>
