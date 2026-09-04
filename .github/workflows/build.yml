@@ -36,12 +36,11 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # fytcanbusmonitor/build.gradle reads this file during Gradle configuration.
+      # No package credentials are required for a local APK build.
       - name: Create github.properties
         run: |
-          cat <<EOF2 > github.properties
-          gpr.usr=${{ secrets.GPR_USER }}
-          gpr.key=${{ secrets.GPR_KEY }}
-          EOF2
+          touch github.properties
 
       - name: Make gradlew executable
         run: chmod +x ./gradlew
