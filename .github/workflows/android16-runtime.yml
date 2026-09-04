@@ -60,12 +60,9 @@ jobs:
             adb shell am start -W -n com.aoe.canbusmonitor.turnsound/com.aoe.canbusmonitor.MainActivity
             sleep 8
             echo '===== PROCESS ====='
-            PID="$(adb shell pidof com.aoe.canbusmonitor.turnsound | tr -d '\r')"
-            echo "$PID"
-            test -n "$PID"
+            adb shell pidof com.aoe.canbusmonitor.turnsound
             echo '===== CRASH LOG ====='
-            CRASHES="$(adb logcat -d -v threadtime | grep -E -A 100 -B 30 'FATAL EXCEPTION|Process: com.aoe.canbusmonitor.turnsound' || true)"
-            echo "$CRASHES"
-            test -z "$CRASHES"
+            adb logcat -d -v threadtime | grep -E -A 100 -B 30 'FATAL EXCEPTION|Process: com.aoe.canbusmonitor.turnsound' || true
+            ! adb logcat -d -v threadtime | grep -q 'Process: com.aoe.canbusmonitor.turnsound'
             echo '===== ACTIVITY STATE ====='
             adb shell dumpsys activity activities | grep -A 25 -B 8 'com.aoe.canbusmonitor.turnsound' || true
