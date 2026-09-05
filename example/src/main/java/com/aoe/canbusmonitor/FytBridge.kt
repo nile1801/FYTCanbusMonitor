@@ -41,7 +41,8 @@ private object MonitorDispatcher {
 
 class FytModuleCallback(
     private val moduleName: String,
-    private val onEvent: (FytEvent) -> Unit
+    private val onEvent: (FytEvent) -> Unit,
+    private val shouldDeliverToRule: ((Int) -> Boolean)? = null
 ) : IModuleCallback.Stub() {
     @Throws(RemoteException::class)
     override fun update(
@@ -50,6 +51,12 @@ class FytModuleCallback(
         floatArray: FloatArray?,
         strArray: Array<String?>?
     ) {
+        // Kiểm tra thật sớm trước khi copy array/tạo FytEvent. Với CANBUS, RuleEngine truyền
+        // predicate O(1) dựa trên index; index không có rule sẽ không đi vào đường audio.
+        val deliverToRule = shouldDeliverToRule?.invoke(updateCode) ?: true
+        val deliverToMonitor = MonitorStore.shouldQueueFast(moduleName, updateCode)
+        if (!deliverToRule && !deliverToMonitor) return
+
         val event = FytEvent(
             module = moduleName,
             index = updateCode,
@@ -58,13 +65,12 @@ class FytModuleCallback(
             strings = strArray?.copyOf()
         )
 
-        // Đường ưu tiên: xử lý rule/audio ngay trên callback FYT.
-        // Không format chuỗi, ghi Logcat hay cập nhật monitor trước khi xét luật.
-        onEvent(event)
+        // Đường ưu tiên: chỉ index được RuleEngine quan tâm mới vào đây.
+        if (deliverToRule) onEvent(event)
 
-        // Đường phụ: monitor/log chạy ở worker riêng. Nếu CAN spam quá nhanh,
-        // hàng đợi có giới hạn và bỏ log cũ thay vì làm nghẽn callback CAN.
-        MonitorDispatcher.submit(event)
+        // Đường phụ: filter đã được xét trước queue. Ví dụ exclude CANBUS:1019 thì 1019
+        // không còn tạo Runnable trong queue monitor. Queue vẫn giới hạn để bảo vệ callback.
+        if (deliverToMonitor) MonitorDispatcher.submit(event)
     }
 }
 
