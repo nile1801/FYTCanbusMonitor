@@ -96,6 +96,7 @@ class MainActivity : Activity() {
         if (storagePermissionDialogShown) requestNotificationPermissionIfNeeded()
 
         MonitorCaptureState.enabled = selectedTabIndex == 0 && !monitorPaused
+        sendServiceAction(TurnSignalService.ACTION_UPDATE_SUBSCRIPTIONS)
         handler.removeCallbacks(refresher)
         handler.post(refresher)
         renderRules()
@@ -103,6 +104,7 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         MonitorCaptureState.enabled = false
+        sendServiceAction(TurnSignalService.ACTION_UPDATE_SUBSCRIPTIONS)
         handler.removeCallbacks(refresher)
         super.onPause()
     }
@@ -138,6 +140,7 @@ class MainActivity : Activity() {
                 setOnClickListener {
                     selectedTabIndex = pageIndex
                     MonitorCaptureState.enabled = pageIndex == 0 && !monitorPaused
+                    sendServiceAction(TurnSignalService.ACTION_UPDATE_SUBSCRIPTIONS)
                     pages.forEachIndexed { index, page ->
                         page.visibility = if (index == pageIndex) View.VISIBLE else View.GONE
                     }
@@ -193,6 +196,7 @@ class MainActivity : Activity() {
                 monitorPaused = !monitorPaused
                 text = if (monitorPaused) "TIẾP TỤC" else "TẠM DỪNG"
                 MonitorCaptureState.enabled = selectedTabIndex == 0 && !monitorPaused
+                sendServiceAction(TurnSignalService.ACTION_UPDATE_SUBSCRIPTIONS)
                 if (!monitorPaused) lastMonitorVersion = -1L
             }
         }
@@ -211,7 +215,7 @@ class MainActivity : Activity() {
         root.addView(controls)
 
         filterStatusText = TextView(this).apply {
-            text = "Bộ lọc log: ${MonitorStore.filterSummary()} • monitor chỉ capture khi tab Giám sát đang mở"
+            text = "Bộ lọc log: ${MonitorStore.filterSummary()} • foreground Monitor mới mở rộng subscription; background chỉ giữ index rule"
             setPadding(0, dp(5), 0, dp(2))
         }
         root.addView(filterStatusText)
@@ -516,10 +520,10 @@ class MainActivity : Activity() {
                 val safeIndexes = parsedIndexes ?: SettingsStore.monitorFilterIndexes(this)
                 SettingsStore.setMonitorFilter(this, mode, module, safeIndexes)
                 MonitorStore.configureFilter(mode, module, safeIndexes)
-                filterStatusText.text = "Bộ lọc log: ${MonitorStore.filterSummary()} • monitor chỉ capture khi tab Giám sát đang mở"
+                filterStatusText.text = "Bộ lọc log: ${MonitorStore.filterSummary()} • foreground Monitor mới mở rộng subscription; background chỉ giữ index rule"
                 lastMonitorVersion = -1L
                 refreshMonitor()
-                sendServiceAction(TurnSignalService.ACTION_REFRESH)
+                sendServiceAction(TurnSignalService.ACTION_UPDATE_SUBSCRIPTIONS)
                 toast("Đã áp dụng: ${MonitorStore.filterSummary()}")
                 dialog.dismiss()
             }

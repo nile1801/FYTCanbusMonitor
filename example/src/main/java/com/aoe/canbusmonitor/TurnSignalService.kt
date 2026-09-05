@@ -19,6 +19,15 @@ class TurnSignalService : Service() {
     private lateinit var audio: AudioEngine
     private lateinit var ruleEngine: RuleEngine
     private val observers = arrayListOf<ConnectionObserver>()
+    private var mainSubscription: DynamicModuleSubscription? = null
+    private var btSubscription: DynamicModuleSubscription? = null
+    private var canSubscription: DynamicModuleSubscription? = null
+    private var currentRules: List<CanRule> = emptyList()
+
+    private val monitorMainIndexes = concatRanges(0..76, 78..200)
+    private val monitorBtIndexes = concatRanges(0..100)
+    private val monitorCanIndexes = concatRanges(0..200, 500..600, 1000..1200)
+
     @Volatile private var destroying = false
 
     private val statusObserver = object : ConnectionObserver {
@@ -62,7 +71,8 @@ class TurnSignalService : Service() {
             updateNotification()
         }
         ruleEngine.setStopMode(SettingsStore.stopMode(this))
-        ruleEngine.setRules(RuleStore.load(this))
+        currentRules = RuleStore.load(this)
+        ruleEngine.setRules(currentRules)
 
         if (RuntimeState.fytPackagePresent) {
             connectToFyt()
@@ -92,22 +102,17 @@ class TurnSignalService : Service() {
             shouldDeliverToRule = { index -> ruleEngine.hasRuleFor(RuleModule.CANBUS.name, index) }
         )
 
+        mainSubscription = DynamicModuleSubscription(MODULE_CODE_MAIN, mainCallback)
+        btSubscription = DynamicModuleSubscription(MODULE_CODE_BT, btCallback)
+        canSubscription = DynamicModuleSubscription(MODULE_CODE_CANBUS, canCallback)
+
         observers += statusObserver
-        observers += ModuleSubscription(
-            MODULE_CODE_MAIN,
-            mainCallback,
-            concatRanges(0..76, 78..200)
-        )
-        observers += ModuleSubscription(
-            MODULE_CODE_BT,
-            btCallback,
-            concatRanges(0..100)
-        )
-        observers += ModuleSubscription(
-            MODULE_CODE_CANBUS,
-            canCallback,
-            concatRanges(0..200, 500..600, 1000..1200)
-        )
+        observers += mainSubscription!!
+        observers += btSubscription!!
+        observers += canSubscription!!
+
+        // Chốt desired indexes trước khi kết nối; onConnected chỉ apply đúng tập hiện tại.
+        updateSubscriptions()
 
         observers.forEach { MsToolkitConnection.instance.addObserver(it) }
         try {
@@ -134,6 +139,7 @@ class TurnSignalService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_REFRESH -> refreshConfiguration()
+            ACTION_UPDATE_SUBSCRIPTIONS -> updateSubscriptions()
             ACTION_TEST_SOUND -> {
                 audio.setVolume(SettingsStore.volume(this))
                 audio.startTest()
@@ -158,8 +164,10 @@ class TurnSignalService : Service() {
         )
         ruleEngine.setHoldMillis(SettingsStore.timeoutMillis(this).toLong())
         ruleEngine.setStopMode(SettingsStore.stopMode(this))
-        ruleEngine.setRules(RuleStore.load(this))
+        currentRules = RuleStore.load(this)
+        ruleEngine.setRules(currentRules)
         audio.setVolume(SettingsStore.volume(this))
+        updateSubscriptions()
 
         if (SettingsStore.isEnabled(this) && ruleEngine.active) {
             audio.setRuleActive(true)
@@ -167,6 +175,65 @@ class TurnSignalService : Service() {
             audio.stopRule()
         }
         updateNotification()
+    }
+
+    /**
+     * Background / tab khác / Monitor pause:
+     *   chỉ subscribe index thật sự có trong enabled CANBUS/MAIN rules.
+     *
+     * Monitor foreground:
+     *   subscribe rule indexes + phần monitor cần theo filter đã lưu.
+     *   ALL     -> full monitor ranges
+     *   ONLY    -> chỉ các index filter của đúng module
+     *   EXCLUDE -> full ranges trừ index filter của đúng module
+     *
+     * Rule indexes luôn được union trở lại, nên filter log không bao giờ làm mất trigger âm thanh.
+     */
+    private fun updateSubscriptions() {
+        val ruleCan = currentRules.asSequence()
+            .filter { it.enabled && it.module == RuleModule.CANBUS }
+            .map { it.index }
+            .filter { it >= 0 }
+            .toSet()
+        val ruleMain = currentRules.asSequence()
+            .filter { it.enabled && it.module == RuleModule.MAIN }
+            .map { it.index }
+            .filter { it >= 0 }
+            .toSet()
+
+        val monitorEnabled = MonitorCaptureState.enabled
+        val mode = SettingsStore.monitorFilterMode(this)
+        val filterModule = SettingsStore.monitorFilterModule(this)
+        val filterIndexes = SettingsStore.monitorFilterIndexes(this)
+
+        fun monitorIndexes(module: String, fullRange: IntArray): Set<Int> {
+            if (!monitorEnabled) return emptySet()
+            return when (mode) {
+                MonitorFilterMode.ALL -> fullRange.toSet()
+                MonitorFilterMode.ONLY_CAN_INDEX ->
+                    if (module == filterModule) filterIndexes else emptySet()
+                MonitorFilterMode.EXCLUDE_CAN_INDEX ->
+                    if (module == filterModule) {
+                        fullRange.asSequence().filter { it !in filterIndexes }.toSet()
+                    } else {
+                        fullRange.toSet()
+                    }
+            }
+        }
+
+        val mainWanted = (ruleMain + monitorIndexes(RuleModule.MAIN.name, monitorMainIndexes))
+            .sorted()
+            .toIntArray()
+        val canWanted = (ruleCan + monitorIndexes(RuleModule.CANBUS.name, monitorCanIndexes))
+            .sorted()
+            .toIntArray()
+        val btWanted = monitorIndexes("BT", monitorBtIndexes)
+            .sorted()
+            .toIntArray()
+
+        mainSubscription?.setIndexes(mainWanted)
+        canSubscription?.setIndexes(canWanted)
+        btSubscription?.setIndexes(btWanted)
     }
 
     override fun onDestroy() {
@@ -235,6 +302,7 @@ class TurnSignalService : Service() {
 
     companion object {
         const val ACTION_REFRESH = "com.aoe.canbusmonitor.turnsound.REFRESH"
+        const val ACTION_UPDATE_SUBSCRIPTIONS = "com.aoe.canbusmonitor.turnsound.UPDATE_SUBSCRIPTIONS"
         const val ACTION_TEST_SOUND = "com.aoe.canbusmonitor.turnsound.TEST"
         const val ACTION_STOP_TEST = "com.aoe.canbusmonitor.turnsound.STOP_TEST"
         const val ACTION_STOP_SERVICE = "com.aoe.canbusmonitor.turnsound.STOP_SERVICE"

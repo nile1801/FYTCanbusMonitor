@@ -83,28 +83,106 @@ class FytModuleCallback(
     }
 }
 
-class ModuleSubscription(
+private object SubscriptionDispatcher {
+    private val executor = ThreadPoolExecutor(
+        1,
+        1,
+        0L,
+        TimeUnit.MILLISECONDS,
+        ArrayBlockingQueue(32),
+        ThreadFactory { runnable ->
+            Thread(runnable, "FYT-Subscriptions").apply {
+                isDaemon = true
+                priority = Thread.NORM_PRIORITY
+            }
+        },
+        ThreadPoolExecutor.DiscardOldestPolicy()
+    )
+
+    fun execute(block: () -> Unit) {
+        executor.execute {
+            try {
+                block()
+            } catch (t: Throwable) {
+                RuntimeState.lastError = "Subscription worker: ${t.javaClass.simpleName}: ${t.message}"
+            }
+        }
+    }
+}
+
+/**
+ * Subscription động:
+ * - desiredIndexes được đổi rất nhanh trên caller thread.
+ * - register/unregister Binder chạy trên worker riêng, không chặn main/UI.
+ * - chỉ diff phần thay đổi, không re-register toàn bộ khi không cần.
+ */
+class DynamicModuleSubscription(
     private val moduleId: Int,
-    private val callback: IModuleCallback,
-    private val indexes: IntArray
+    private val callback: IModuleCallback
 ) : ConnectionObserver {
     private val remoteProxy = RemoteModuleProxy()
+    private val desiredIndexes = linkedSetOf<Int>()
+    private val registeredIndexes = linkedSetOf<Int>()
+
+    @Synchronized
+    fun setIndexes(indexes: IntArray) {
+        val next = indexes.asSequence()
+            .filter { it >= 0 }
+            .distinct()
+            .sorted()
+            .toCollection(linkedSetOf())
+
+        if (desiredIndexes == next) return
+        desiredIndexes.clear()
+        desiredIndexes.addAll(next)
+        scheduleApply()
+    }
 
     override fun onConnected(toolkit: IRemoteToolkit?) {
         try {
-            remoteProxy.remoteModule = toolkit?.getRemoteModule(moduleId)
-            indexes.forEach { index -> remoteProxy.register(callback, index, 1) }
+            synchronized(this) {
+                remoteProxy.remoteModule = toolkit?.getRemoteModule(moduleId)
+                registeredIndexes.clear()
+            }
+            scheduleApply()
         } catch (t: Throwable) {
-            RuntimeState.lastError = "Module $moduleId register: ${t.javaClass.simpleName}: ${t.message}"
+            RuntimeState.lastError = "Module $moduleId connect: ${t.javaClass.simpleName}: ${t.message}"
         }
     }
 
     override fun onDisconnected() {
-        try {
-            indexes.forEach { index -> remoteProxy.unregister(callback, index) }
-        } catch (_: Throwable) {
-        } finally {
-            remoteProxy.remoteModule = null
+        SubscriptionDispatcher.execute {
+            synchronized(this) {
+                try {
+                    registeredIndexes.toList().forEach { index ->
+                        remoteProxy.unregister(callback, index)
+                    }
+                } catch (_: Throwable) {
+                } finally {
+                    registeredIndexes.clear()
+                    remoteProxy.remoteModule = null
+                }
+            }
+        }
+    }
+
+    private fun scheduleApply() {
+        SubscriptionDispatcher.execute {
+            synchronized(this) {
+                if (remoteProxy.remoteModule == null) return@synchronized
+
+                val remove = registeredIndexes.filter { it !in desiredIndexes }
+                remove.forEach { index ->
+                    remoteProxy.unregister(callback, index)
+                    registeredIndexes.remove(index)
+                }
+
+                val add = desiredIndexes.filter { it !in registeredIndexes }
+                add.forEach { index ->
+                    remoteProxy.register(callback, index, 1)
+                    registeredIndexes.add(index)
+                }
+            }
         }
     }
 }
