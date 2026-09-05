@@ -44,6 +44,12 @@ class TurnSignalService : Service() {
         RuntimeState.serviceRunning = true
         RuntimeState.fytPackagePresent = isFytPackageAvailable()
 
+        // Filter log được lưu persistent. Nó chỉ tác động MonitorStore, không tác động RuleEngine.
+        MonitorStore.configureFilter(
+            SettingsStore.monitorFilterMode(this),
+            SettingsStore.monitorFilterIndex(this)
+        )
+
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
 
@@ -129,6 +135,10 @@ class TurnSignalService : Service() {
     }
 
     private fun refreshConfiguration() {
+        MonitorStore.configureFilter(
+            SettingsStore.monitorFilterMode(this),
+            SettingsStore.monitorFilterIndex(this)
+        )
         ruleEngine.setRules(RuleStore.load(this))
         audio.setVolume(SettingsStore.volume(this))
         if (SettingsStore.isEnabled(this) && ruleEngine.active) {
@@ -143,6 +153,7 @@ class TurnSignalService : Service() {
         destroying = true
         observers.forEach { MsToolkitConnection.instance.removeObserver(it) }
         observers.clear()
+        if (::ruleEngine.isInitialized) ruleEngine.release()
         if (::audio.isInitialized) audio.release()
         RuntimeState.serviceRunning = false
         RuntimeState.fytConnected = false
