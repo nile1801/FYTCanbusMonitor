@@ -27,7 +27,7 @@ class TurnSignalService : Service() {
 
     private var currentRules: List<CanRule> = emptyList()
     private var currentStopMode: StopMode = StopMode.TIMEOUT
-    private var soundEnabled = true
+    @Volatile private var soundEnabled = true
     private var ruleCanIndexes: Set<Int> = emptySet()
     private var ruleMainIndexes: Set<Int> = emptySet()
 

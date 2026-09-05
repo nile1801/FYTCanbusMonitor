@@ -198,7 +198,7 @@ class MainActivity : Activity() {
         pages.forEachIndexed { index, page -> page.visibility = if (index == 0) View.VISIBLE else View.GONE }
         buttons.forEachIndexed { index, button -> button.isEnabled = index != 0 }
         selectedTabIndex = 0
-        MonitorCaptureState.enabled = !monitorPaused
+        MonitorCaptureState.enabled = false
         return root
     }
 
