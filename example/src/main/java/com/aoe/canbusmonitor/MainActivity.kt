@@ -17,6 +17,7 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.view.View
 import android.view.ViewGroup
+import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
@@ -69,6 +70,9 @@ class MainActivity : Activity() {
             SettingsStore.monitorFilterIndexes(this)
         )
 
+        // Restore rules + stopMode + timeout trước khi dựng UI nếu backup đã đọc được.
+        RuleStore.load(this)
+
         setContentView(buildTabbedUi())
         renderRules()
         startTurnService()
@@ -85,11 +89,13 @@ class MainActivity : Activity() {
         val hasStorageAccess = hasPersistentStorageAccess()
         if (hasStorageAccess && !storageAccessWasGranted) {
             val restoredRules = RuleStore.load(this)
-            renderRules()
             sendServiceAction(TurnSignalService.ACTION_REFRESH)
             if (restoredRules.isNotEmpty()) {
-                toast("Đã đọc lại ${restoredRules.size} rule sau khi cấp quyền backup")
+                toast("Đã đọc lại ${restoredRules.size} rule + cài đặt tắt sau khi cấp quyền backup")
             }
+            // Rebuild UI để RadioGroup/SeekBar phản ánh stopMode + timeout vừa restore.
+            recreate()
+            return
         }
         storageAccessWasGranted = hasStorageAccess
         refreshStorageAccessStatus()
@@ -276,7 +282,46 @@ class MainActivity : Activity() {
             setOnClickListener { openAllFilesAccessSettings() }
         })
         root.addView(TextView(this).apply {
-            text = "Backup rule: ${RuleBackupStore.DISPLAY_PATH}. Muốn tự restore sau khi uninstall/cài lại, Android 11+ cần bật quyền Quản lý tất cả tệp cho app."
+            text = "Config đang chạy: ${RuleBackupStore.DISPLAY_PATH}. Snapshot mặc định tự lưu: ${RuleBackupStore.DEFAULT_CONFIG_DISPLAY_PATH}. Muốn giữ qua uninstall/cài lại, Android 11+ cần bật quyền Quản lý tất cả tệp cho app."
+            setPadding(0, dp(4), 0, dp(6))
+        })
+
+        val defaultRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        defaultRow.addView(Button(this).apply {
+            text = "LOAD CONFIG MẶC ĐỊNH"
+            setOnClickListener {
+                val savedDefault = RuleBackupStore.readDefault(this@MainActivity)
+                val sourceText = savedDefault ?: RuleStore.builtInDefaultConfig()
+                val restored = RuleStore.applyExternalConfig(this@MainActivity, sourceText)
+                if (restored == null) {
+                    toast("Config mặc định lỗi, không thể load")
+                    return@setOnClickListener
+                }
+                sendServiceAction(TurnSignalService.ACTION_REFRESH)
+                toast(
+                    if (savedDefault != null) {
+                        "Đã load mặc định anh lưu gần nhất (${restored.size} rule)"
+                    } else {
+                        "Đã load bộ mặc định gốc (${restored.size} rule)"
+                    }
+                )
+                recreate()
+            }
+        }, weightParams())
+        defaultRow.addView(Button(this).apply {
+            text = "LƯU CONFIG MẶC ĐỊNH"
+            setOnClickListener {
+                val snapshot = RuleStore.exportCurrentConfig(this@MainActivity)
+                if (RuleBackupStore.writeDefault(this@MainActivity, snapshot)) {
+                    toast("Đã lưu config hiện tại làm mặc định")
+                } else {
+                    toast("Không ghi được ${RuleBackupStore.DEFAULT_CONFIG_DISPLAY_PATH}")
+                }
+            }
+        }, weightParams())
+        root.addView(defaultRow)
+        root.addView(TextView(this).apply {
+            text = "LOAD sẽ override rules.json hiện tại. Nếu chưa từng bấm LƯU CONFIG MẶC ĐỊNH thì app dùng bộ mặc định gốc MG G50; sau khi đã lưu, các lần LOAD sau sẽ dùng snapshot mới nhất anh lưu."
             setPadding(0, dp(4), 0, dp(10))
         })
         refreshStorageAccessStatus()
@@ -320,6 +365,7 @@ class MainActivity : Activity() {
                 override fun onStopTrackingTouch(seekBar: SeekBar?) {
                     val value = (seekBar?.progress ?: 0) * SettingsStore.TIMEOUT_STEP_MS
                     SettingsStore.setTimeoutMillis(this@MainActivity, value)
+                    RuleStore.syncBackup(this@MainActivity)
                     sendServiceAction(TurnSignalService.ACTION_REFRESH)
                 }
             })
@@ -334,6 +380,7 @@ class MainActivity : Activity() {
         stopModeGroup.setOnCheckedChangeListener { _, checkedId ->
             val mode = if (checkedId == triggerId) StopMode.TRIGGER else StopMode.TIMEOUT
             SettingsStore.setStopMode(this, mode)
+            RuleStore.syncBackup(this)
             sendServiceAction(TurnSignalService.ACTION_REFRESH)
         }
 
@@ -685,7 +732,51 @@ class MainActivity : Activity() {
         val targetValues = SignalTarget.values()
         val moduleSpinner = addSpinner("Nguồn", moduleValues.map { it.name }, moduleValues.indexOf(base.module))
         val actionSpinner = addSpinner("Hành động", actionValues.map { it.label() }, actionValues.indexOf(base.action))
-        val targetSpinner = addSpinner("Map vào", targetValues.map { it.label() }, targetValues.indexOf(base.target))
+
+        val singleTargetLabel = TextView(this).apply { text = "Map vào" }
+        root.addView(singleTargetLabel)
+        val targetSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                targetValues.map { it.label() }
+            )
+            setSelection(targetValues.indexOf(base.target).coerceAtLeast(0))
+        }
+        root.addView(targetSpinner)
+
+        val stopTargetsLabel = TextView(this).apply {
+            text = "Map trigger TẮT vào (có thể chọn nhiều)"
+            setPadding(0, dp(6), 0, 0)
+        }
+        root.addView(stopTargetsLabel)
+        val stopTargetsBox = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val stopTargetChecks = targetValues.map { target ->
+            CheckBox(this).apply {
+                text = target.label()
+                isChecked = base.action == RuleAction.STOP && base.target == target
+            }.also { stopTargetsBox.addView(it, weightParams()) }
+        }
+        if (base.action == RuleAction.STOP && stopTargetChecks.none { it.isChecked }) {
+            stopTargetChecks[SignalTarget.LEFT.ordinal].isChecked = true
+        }
+        root.addView(stopTargetsBox)
+
+        fun refreshTargetControls() {
+            val isStop = actionValues[actionSpinner.selectedItemPosition] == RuleAction.STOP
+            singleTargetLabel.visibility = if (isStop) View.GONE else View.VISIBLE
+            targetSpinner.visibility = if (isStop) View.GONE else View.VISIBLE
+            stopTargetsLabel.visibility = if (isStop) View.VISIBLE else View.GONE
+            stopTargetsBox.visibility = if (isStop) View.VISIBLE else View.GONE
+        }
+        actionSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                refreshTargetControls()
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+        refreshTargetControls()
+
         val indexEdit = numberField("Index", base.index)
         val positionEdit = numberField("Vị trí trong IntArray", base.position)
         val valueEdit = numberField("Giá trị cần khớp", base.expectedValue)
@@ -732,18 +823,40 @@ class MainActivity : Activity() {
                     return@setOnClickListener
                 }
 
+                val selectedAction = actionValues[actionSpinner.selectedItemPosition]
+                val selectedTargets = if (selectedAction == RuleAction.STOP) {
+                    targetValues.filterIndexed { index, _ -> stopTargetChecks[index].isChecked }
+                } else {
+                    listOf(targetValues[targetSpinner.selectedItemPosition])
+                }
+                if (selectedTargets.isEmpty()) {
+                    toast("Trigger TẮT phải map vào ít nhất một nhóm")
+                    return@setOnClickListener
+                }
+
                 val rules = RuleStore.load(this)
-                val updated = base.copy(
-                    module = moduleValues[moduleSpinner.selectedItemPosition],
-                    action = actionValues[actionSpinner.selectedItemPosition],
-                    target = targetValues[targetSpinner.selectedItemPosition],
-                    index = idx,
-                    position = pos,
-                    expectedValue = value,
-                    unsignedByte = unsigned.isChecked
-                )
-                val oldIndex = rules.indexOfFirst { it.id == updated.id }
-                if (oldIndex >= 0) rules[oldIndex] = updated else rules.add(updated)
+                // Khi sửa, bỏ rule gốc rồi tạo lại. STOP chọn nhiều target sẽ sinh nhiều rule
+                // giống hệt nhau, chỉ khác target/map như yêu cầu.
+                rules.removeAll { it.id == base.id }
+                selectedTargets.forEachIndexed { targetIndex, target ->
+                    val ruleId = if (targetIndex == 0) {
+                        base.id
+                    } else {
+                        java.util.UUID.randomUUID().toString()
+                    }
+                    rules.add(
+                        base.copy(
+                            id = ruleId,
+                            module = moduleValues[moduleSpinner.selectedItemPosition],
+                            action = selectedAction,
+                            target = target,
+                            index = idx,
+                            position = pos,
+                            expectedValue = value,
+                            unsignedByte = unsigned.isChecked
+                        )
+                    )
+                }
                 RuleStore.save(this, rules)
                 dialog.dismiss()
                 renderRules()

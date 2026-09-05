@@ -70,8 +70,9 @@ class TurnSignalService : Service() {
             audio.setRuleActive(state.anyActive && SettingsStore.isEnabled(this))
             updateNotification()
         }
-        ruleEngine.setStopMode(SettingsStore.stopMode(this))
         currentRules = RuleStore.load(this)
+        ruleEngine.setHoldMillis(SettingsStore.timeoutMillis(this).toLong())
+        ruleEngine.setStopMode(SettingsStore.stopMode(this))
         ruleEngine.setRules(currentRules)
 
         if (RuntimeState.fytPackagePresent) {
@@ -162,9 +163,9 @@ class TurnSignalService : Service() {
             SettingsStore.monitorFilterModule(this),
             SettingsStore.monitorFilterIndexes(this)
         )
+        currentRules = RuleStore.load(this)
         ruleEngine.setHoldMillis(SettingsStore.timeoutMillis(this).toLong())
         ruleEngine.setStopMode(SettingsStore.stopMode(this))
-        currentRules = RuleStore.load(this)
         ruleEngine.setRules(currentRules)
         audio.setVolume(SettingsStore.volume(this))
         updateSubscriptions()

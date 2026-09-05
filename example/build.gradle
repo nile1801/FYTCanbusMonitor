@@ -11,8 +11,8 @@ android {
         applicationId "com.aoe.canbusmonitor.turnsound"
         minSdk 33
         targetSdk 33
-        versionCode 12
-        versionName "1.6.2-dynamic-rule-subscriptions"
+        versionCode 13
+        versionName "1.6.3-config-defaults-multistop"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }

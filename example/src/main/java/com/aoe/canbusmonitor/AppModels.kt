@@ -191,7 +191,7 @@ data class CanRule(
 object RuleStore {
     private const val PREFS = "turn_sound_rules"
     private const val KEY = "rules_json"
-    private const val BACKUP_SCHEMA_VERSION = 2
+    private const val BACKUP_SCHEMA_VERSION = 3
 
     private data class ParseResult(
         val rules: MutableList<CanRule>,
@@ -224,11 +224,12 @@ object RuleStore {
         if (!backupText.isNullOrBlank()) {
             val restored = parseRules(backupText)
             if (restored != null) {
+                restoreSettingsFromConfig(context, backupText)
                 prefs.edit().putString(KEY, rulesToArray(restored.rules).toString()).apply()
                 pendingStatusMessage = if (restored.skipped > 0) {
-                    "Đã tự restore ${restored.rules.size} rule từ ${RuleBackupStore.DISPLAY_PATH}; bỏ qua ${restored.skipped} rule lỗi."
+                    "Đã tự restore ${restored.rules.size} rule + cài đặt tắt từ ${RuleBackupStore.DISPLAY_PATH}; bỏ qua ${restored.skipped} rule lỗi."
                 } else {
-                    "Đã tự restore ${restored.rules.size} rule từ ${RuleBackupStore.DISPLAY_PATH}."
+                    "Đã tự restore ${restored.rules.size} rule + cài đặt tắt từ ${RuleBackupStore.DISPLAY_PATH}."
                 }
                 return restored.rules
             }
@@ -245,14 +246,98 @@ object RuleStore {
             .putString(KEY, array.toString())
             .apply()
 
-        val backup = JSONObject().apply {
-            put("schemaVersion", BACKUP_SCHEMA_VERSION)
-            put("savedAt", System.currentTimeMillis())
-            put("rules", array)
-        }
-        if (!RuleBackupStore.write(context, backup.toString(2))) {
+        if (!RuleBackupStore.write(context, configToJson(context, rules).toString(2))) {
             pendingStatusMessage = "Đã lưu rule trong app nhưng chưa ghi được backup ${RuleBackupStore.DISPLAY_PATH}."
         }
+    }
+
+    /** Ghi lại stopMode + timeout hiện tại vào rules.json mà không thay rule. */
+    fun syncBackup(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val localText = prefs.getString(KEY, null)
+        val rules = if (!localText.isNullOrBlank()) {
+            parseRules(localText)?.rules
+        } else {
+            null
+        } ?: load(context)
+
+        if (!RuleBackupStore.write(context, configToJson(context, rules).toString(2))) {
+            pendingStatusMessage = "Đã lưu cài đặt trong app nhưng chưa cập nhật được ${RuleBackupStore.DISPLAY_PATH}."
+        }
+    }
+
+    /** Snapshot đầy đủ để dùng cho nút LƯU CONFIG MẶC ĐỊNH. */
+    fun exportCurrentConfig(context: Context): String {
+        return configToJson(context, load(context)).toString(2)
+    }
+
+    /**
+     * Áp một snapshot ngoài vào config hiện tại. Hàm này cố ý gọi save() để rules.json
+     * bị override đúng theo config vừa load.
+     */
+    fun applyExternalConfig(context: Context, text: String): MutableList<CanRule>? {
+        val parsed = parseRules(text) ?: return null
+        restoreSettingsFromConfig(context, text)
+        save(context, parsed.rules)
+        pendingStatusMessage = if (parsed.skipped > 0) {
+            "Đã áp config ${parsed.rules.size} rule; bỏ qua ${parsed.skipped} rule lỗi."
+        } else {
+            "Đã áp config ${parsed.rules.size} rule."
+        }
+        return parsed.rules
+    }
+
+    /**
+     * Bộ mặc định gốc chỉ dùng khi chưa từng có default_config.json do user lưu.
+     * CANBUS:1049 dùng byte thứ 2 (position=1) để phân biệt 80/72/64.
+     */
+    fun builtInDefaultConfig(): String {
+        val rules = listOf(
+            CanRule(module = RuleModule.CANBUS, action = RuleAction.START, target = SignalTarget.LEFT, index = 1049, position = 1, expectedValue = 80),
+            CanRule(module = RuleModule.CANBUS, action = RuleAction.START, target = SignalTarget.RIGHT, index = 1049, position = 1, expectedValue = 72),
+            CanRule(module = RuleModule.CANBUS, action = RuleAction.STOP, target = SignalTarget.LEFT, index = 1049, position = 1, expectedValue = 64),
+            CanRule(module = RuleModule.CANBUS, action = RuleAction.STOP, target = SignalTarget.RIGHT, index = 1049, position = 1, expectedValue = 64),
+            CanRule(module = RuleModule.MAIN, action = RuleAction.START, target = SignalTarget.HAZARD, index = 139, position = 0, expectedValue = 1),
+            CanRule(module = RuleModule.MAIN, action = RuleAction.STOP, target = SignalTarget.HAZARD, index = 139, position = 0, expectedValue = 0)
+        )
+        return configToJson(rules, StopMode.TRIGGER, SettingsStore.DEFAULT_TIMEOUT_MS).toString(2)
+    }
+
+    private fun configToJson(context: Context, rules: List<CanRule>): JSONObject {
+        return configToJson(
+            rules = rules,
+            stopMode = SettingsStore.stopMode(context),
+            timeoutMs = SettingsStore.timeoutMillis(context)
+        )
+    }
+
+    private fun configToJson(rules: List<CanRule>, stopMode: StopMode, timeoutMs: Int): JSONObject {
+        return JSONObject().apply {
+            put("schemaVersion", BACKUP_SCHEMA_VERSION)
+            put("savedAt", System.currentTimeMillis())
+            put("settings", JSONObject().apply {
+                put("stopMode", stopMode.name)
+                put("timeoutMs", timeoutMs)
+            })
+            put("rules", rulesToArray(rules))
+        }
+    }
+
+    private fun restoreSettingsFromConfig(context: Context, text: String) {
+        val trimmed = text.trim()
+        if (!trimmed.startsWith("{")) return
+        val settings = try {
+            JSONObject(trimmed).optJSONObject("settings")
+        } catch (_: Throwable) {
+            null
+        } ?: return
+
+        val stopMode = runCatching {
+            StopMode.valueOf(settings.optString("stopMode", StopMode.TIMEOUT.name))
+        }.getOrDefault(StopMode.TIMEOUT)
+        val timeout = settings.optInt("timeoutMs", SettingsStore.DEFAULT_TIMEOUT_MS)
+        SettingsStore.setStopMode(context, stopMode)
+        SettingsStore.setTimeoutMillis(context, timeout)
     }
 
     private fun rulesToArray(rules: List<CanRule>): JSONArray {
@@ -276,7 +361,8 @@ object RuleStore {
     /**
      * Backward compatible:
      * - format cũ: top-level JSONArray
-     * - format mới: { schemaVersion, rules: [...] }
+     * - schema v2: { schemaVersion, rules: [...] }
+     * - schema v3: thêm settings.stopMode + settings.timeoutMs
      * - field module/action/target thiếu => CANBUS/START/LEFT
      * - rule lỗi độc lập bị skip, các rule còn đọc được vẫn restore.
      */
