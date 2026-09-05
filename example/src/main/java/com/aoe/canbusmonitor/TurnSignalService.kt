@@ -52,10 +52,7 @@ class TurnSignalService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
 
-        // Decode MP3 đúng một lần thành PCM trong RAM.
         audio = AudioEngine(this)
-
-        // State tách riêng TRÁI / PHẢI / HAZARD. Audio chỉ cần biết có ít nhất một nhóm đang active.
         ruleEngine = RuleEngine { state ->
             RuntimeState.leftActive = state.left
             RuntimeState.rightActive = state.right
@@ -77,23 +74,21 @@ class TurnSignalService : Service() {
     }
 
     private fun connectToFyt() {
-        // MAIN giờ có thể dùng làm rule, ví dụ hazard của xe chỉ phát event ở module MAIN.
         val mainCallback = FytModuleCallback(
             moduleName = RuleModule.MAIN.name,
-            onEvent = { event -> ruleEngine.onFytEvent(event) },
+            onRuleEvent = { module, index, ints -> ruleEngine.onRawEvent(module, index, ints) },
             shouldDeliverToRule = { index -> ruleEngine.hasRuleFor(RuleModule.MAIN.name, index) }
         )
 
-        // BT vẫn chỉ dùng monitor/debug.
         val btCallback = FytModuleCallback(
             moduleName = "BT",
-            onEvent = { },
+            onRuleEvent = { _, _, _ -> },
             shouldDeliverToRule = { false }
         )
 
         val canCallback = FytModuleCallback(
             moduleName = RuleModule.CANBUS.name,
-            onEvent = { event -> ruleEngine.onFytEvent(event) },
+            onRuleEvent = { module, index, ints -> ruleEngine.onRawEvent(module, index, ints) },
             shouldDeliverToRule = { index -> ruleEngine.hasRuleFor(RuleModule.CANBUS.name, index) }
         )
 
