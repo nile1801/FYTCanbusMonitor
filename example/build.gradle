@@ -11,8 +11,8 @@ android {
         applicationId "com.aoe.canbusmonitor.turnsound"
         minSdk 33
         targetSdk 33
-        versionCode 6
-        versionName "1.4.1-pcm-audiotrack-fix"
+        versionCode 7
+        versionName "1.4.2-pcm-stream-fix"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
