@@ -75,9 +75,24 @@ class TurnSignalService : Service() {
     }
 
     private fun connectToFyt() {
-        val mainCallback = FytModuleCallback("MAIN") { }
-        val btCallback = FytModuleCallback("BT") { }
-        val canCallback = FytModuleCallback("CANBUS") { event -> ruleEngine.onCanEvent(event) }
+        // MAIN/BT chỉ phục vụ monitor; không có đường rule/audio.
+        val mainCallback = FytModuleCallback(
+            moduleName = "MAIN",
+            onEvent = { },
+            shouldDeliverToRule = { false }
+        )
+        val btCallback = FytModuleCallback(
+            moduleName = "BT",
+            onEvent = { },
+            shouldDeliverToRule = { false }
+        )
+
+        // CANBUS lookup rule index O(1) ngay ở Binder callback, trước khi copy array/tạo FytEvent.
+        val canCallback = FytModuleCallback(
+            moduleName = "CANBUS",
+            onEvent = { event -> ruleEngine.onCanEvent(event) },
+            shouldDeliverToRule = { index -> ruleEngine.hasRuleForIndex(index) }
+        )
 
         observers += statusObserver
         observers += ModuleSubscription(
