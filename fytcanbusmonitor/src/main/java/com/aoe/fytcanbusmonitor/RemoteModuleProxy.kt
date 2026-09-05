@@ -3,7 +3,7 @@ package com.aoe.fytcanbusmonitor
 import android.os.RemoteException
 
 class RemoteModuleProxy : IRemoteModule.Stub() {
-    var remoteModule: IRemoteModule? = null
+    @Volatile var remoteModule: IRemoteModule? = null
     var moduleType = -1
 
     // com.syu.ipc.IRemoteModule
@@ -126,27 +126,33 @@ class RemoteModuleProxy : IRemoteModule.Stub() {
         } else null
     }
 
-    // com.syu.ipc.IRemoteModule
-    override fun register(callback: IModuleCallback?, updateCode: Int, update: Int) {
-        val remoteModule = remoteModule
-        if (remoteModule != null) {
-            try {
-                remoteModule.register(callback, updateCode, update)
-            } catch (e: RemoteException) {
-                e.printStackTrace()
-            }
+    fun registerSafe(callback: IModuleCallback?, updateCode: Int, update: Int): Boolean {
+        val remote = remoteModule ?: return false
+        return try {
+            remote.register(callback, updateCode, update)
+            true
+        } catch (_: RemoteException) {
+            false
+        }
+    }
+
+    fun unregisterSafe(callback: IModuleCallback?, updateCode: Int): Boolean {
+        val remote = remoteModule ?: return false
+        return try {
+            remote.unregister(callback, updateCode)
+            true
+        } catch (_: RemoteException) {
+            false
         }
     }
 
     // com.syu.ipc.IRemoteModule
+    override fun register(callback: IModuleCallback?, updateCode: Int, update: Int) {
+        registerSafe(callback, updateCode, update)
+    }
+
+    // com.syu.ipc.IRemoteModule
     override fun unregister(callback: IModuleCallback?, updateCode: Int) {
-        val remoteModule = remoteModule
-        if (remoteModule != null) {
-            try {
-                remoteModule.unregister(callback, updateCode)
-            } catch (e: RemoteException) {
-                e.printStackTrace()
-            }
-        }
+        unregisterSafe(callback, updateCode)
     }
 }

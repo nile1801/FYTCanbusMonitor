@@ -6,10 +6,10 @@ import com.aoe.fytcanbusmonitor.IModuleCallback
 import com.aoe.fytcanbusmonitor.IRemoteToolkit
 import com.aoe.fytcanbusmonitor.RemoteModuleProxy
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.Executors
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 
 /** Monitor chỉ chạy khi tab Giám sát đang mở và không pause. */
 object MonitorCaptureState {
@@ -17,19 +17,19 @@ object MonitorCaptureState {
 }
 
 private object MonitorDispatcher {
-    private val threadNumber = AtomicInteger(1)
     private val executor = ThreadPoolExecutor(
         1,
         1,
         0L,
         TimeUnit.MILLISECONDS,
-        ArrayBlockingQueue(512),
+        ArrayBlockingQueue(256),
         ThreadFactory { runnable ->
-            Thread(runnable, "FYT-Monitor-${threadNumber.getAndIncrement()}").apply {
+            Thread(runnable, "FYT-Monitor").apply {
                 isDaemon = true
-                priority = Thread.NORM_PRIORITY - 1
+                priority = Thread.NORM_PRIORITY
             }
         },
+        // Nếu flood thì ưu tiên giữ event mới thay vì để UI xem log cũ quá trễ.
         ThreadPoolExecutor.DiscardOldestPolicy()
     )
 
@@ -56,47 +56,41 @@ class FytModuleCallback(
         floatArray: FloatArray?,
         strArray: Array<String?>?
     ) {
-        // O(1) lookup trước mọi allocation.
         val deliverToRule = shouldDeliverToRule?.invoke(updateCode) ?: true
         val deliverToMonitor = MonitorCaptureState.enabled &&
             MonitorStore.shouldQueueFast(moduleName, updateCode)
 
         if (!deliverToRule && !deliverToMonitor) return
 
-        // Đường ưu tiên: đọc IntArray AIDL trực tiếp ngay trong callback, không copy, không tạo FytEvent.
-        // RuleEngine không giữ reference sau khi hàm này return.
+        // Rule luôn được xử lý trước monitor và dùng trực tiếp IntArray do Parcel vừa tạo.
         if (deliverToRule) {
             onRuleEvent(moduleName, updateCode, intArray)
         }
 
         if (!deliverToMonitor) return
 
-        // Chỉ debug monitor mới cần snapshot/copy để xử lý bất đồng bộ ở worker riêng.
-        val event = FytEvent(
-            module = moduleName,
-            index = updateCode,
-            ints = intArray?.copyOf(),
-            floats = floatArray?.copyOf(),
-            strings = strArray?.copyOf()
+        // AIDL Stub tạo array mới từ Parcel cho callback này; worker có thể giữ reference an toàn,
+        // không cần copyOf thêm một lần nữa.
+        MonitorDispatcher.submit(
+            FytEvent(
+                module = moduleName,
+                index = updateCode,
+                ints = intArray,
+                floats = floatArray,
+                strings = strArray
+            )
         )
-        MonitorDispatcher.submit(event)
     }
 }
 
 private object SubscriptionDispatcher {
-    private val executor = ThreadPoolExecutor(
-        1,
-        1,
-        0L,
-        TimeUnit.MILLISECONDS,
-        ArrayBlockingQueue(32),
+    private val executor = Executors.newSingleThreadExecutor(
         ThreadFactory { runnable ->
             Thread(runnable, "FYT-Subscriptions").apply {
                 isDaemon = true
                 priority = Thread.NORM_PRIORITY
             }
-        },
-        ThreadPoolExecutor.DiscardOldestPolicy()
+        }
     )
 
     fun execute(block: () -> Unit) {
@@ -112,9 +106,10 @@ private object SubscriptionDispatcher {
 
 /**
  * Subscription động:
- * - desiredIndexes được đổi rất nhanh trên caller thread.
- * - register/unregister Binder chạy trên worker riêng, không chặn main/UI.
- * - chỉ diff phần thay đổi, không re-register toàn bộ khi không cần.
+ * - setIndexes chỉ đổi desired state rất nhanh.
+ * - mỗi module tối đa có một apply-loop đang queue/running; thay đổi liên tiếp được coalesce.
+ * - Binder register/unregister chạy ngoài synchronized lock.
+ * - disconnect chỉ clear local state; không gọi hàng trăm unregister vào Binder đã chết.
  */
 class DynamicModuleSubscription(
     private val moduleId: Int,
@@ -123,6 +118,8 @@ class DynamicModuleSubscription(
     private val remoteProxy = RemoteModuleProxy()
     private val desiredIndexes = linkedSetOf<Int>()
     private val registeredIndexes = linkedSetOf<Int>()
+    private var applyQueued = false
+    private var connectionEpoch = 0L
 
     @Synchronized
     fun setIndexes(indexes: IntArray) {
@@ -135,60 +132,110 @@ class DynamicModuleSubscription(
         if (desiredIndexes == next) return
         desiredIndexes.clear()
         desiredIndexes.addAll(next)
-        scheduleApply()
+        scheduleApplyLocked()
     }
 
     override fun onConnected(toolkit: IRemoteToolkit?) {
         try {
+            val remote = toolkit?.getRemoteModule(moduleId)
             synchronized(this) {
-                remoteProxy.remoteModule = toolkit?.getRemoteModule(moduleId)
+                remoteProxy.remoteModule = remote
                 registeredIndexes.clear()
+                connectionEpoch++
+                scheduleApplyLocked()
             }
-            scheduleApply()
         } catch (t: Throwable) {
             RuntimeState.lastError = "Module $moduleId connect: ${t.javaClass.simpleName}: ${t.message}"
         }
     }
 
     override fun onDisconnected() {
-        SubscriptionDispatcher.execute {
-            synchronized(this) {
-                try {
-                    registeredIndexes.toList().forEach { index ->
-                        remoteProxy.unregister(callback, index)
-                    }
-                } catch (_: Throwable) {
-                } finally {
-                    registeredIndexes.clear()
-                    remoteProxy.remoteModule = null
-                }
-            }
+        synchronized(this) {
+            // Remote service đã mất; unregister lúc này chỉ tạo Binder lỗi/thời gian chờ vô ích.
+            remoteProxy.remoteModule = null
+            registeredIndexes.clear()
+            connectionEpoch++
         }
     }
 
-    private fun scheduleApply() {
-        SubscriptionDispatcher.execute {
+    private fun scheduleApplyLocked() {
+        if (applyQueued) return
+        applyQueued = true
+        SubscriptionDispatcher.execute { applyLoop() }
+    }
+
+    private fun applyLoop() {
+        var consecutiveFailures = 0
+        while (true) {
+            val epoch: Long
+            val desired: Set<Int>
+            val registered: Set<Int>
             synchronized(this) {
-                if (remoteProxy.remoteModule == null) return@synchronized
-
-                val remove = registeredIndexes.filter { it !in desiredIndexes }
-                remove.forEach { index ->
-                    remoteProxy.unregister(callback, index)
-                    registeredIndexes.remove(index)
+                if (remoteProxy.remoteModule == null) {
+                    applyQueued = false
+                    return
                 }
+                epoch = connectionEpoch
+                desired = desiredIndexes.toSet()
+                registered = registeredIndexes.toSet()
+            }
 
-                val add = desiredIndexes.filter { it !in registeredIndexes }
-                add.forEach { index ->
-                    remoteProxy.register(callback, index, 1)
-                    registeredIndexes.add(index)
+            val remove = registered.filter { it !in desired }
+            val add = desired.filter { it !in registered }
+
+            if (remove.isEmpty() && add.isEmpty()) {
+                synchronized(this) {
+                    if (epoch == connectionEpoch && desiredIndexes == registeredIndexes) {
+                        applyQueued = false
+                        return
+                    }
                 }
+                continue
+            }
+
+            val removedOk = ArrayList<Int>(remove.size)
+            val addedOk = ArrayList<Int>(add.size)
+            var failed = false
+
+            // Không giữ synchronized(this) trong các Binder call có thể block.
+            for (index in remove) {
+                if (remoteProxy.unregisterSafe(callback, index)) removedOk += index else failed = true
+            }
+            for (index in add) {
+                if (remoteProxy.registerSafe(callback, index, 1)) addedOk += index else failed = true
+            }
+
+            synchronized(this) {
+                if (epoch == connectionEpoch) {
+                    removedOk.forEach { registeredIndexes.remove(it) }
+                    addedOk.forEach { registeredIndexes.add(it) }
+                }
+            }
+
+            if (failed) {
+                consecutiveFailures++
+                if (consecutiveFailures >= 3) {
+                    RuntimeState.lastError = "Module $moduleId: register/unregister Binder thất bại"
+                    synchronized(this) { applyQueued = false }
+                    return
+                }
+                try {
+                    Thread.sleep(50L)
+                } catch (_: InterruptedException) {
+                }
+            } else {
+                consecutiveFailures = 0
             }
         }
     }
 }
 
 fun concatRanges(vararg ranges: IntRange): IntArray {
-    val out = ArrayList<Int>()
-    ranges.forEach { range -> range.forEach { out.add(it) } }
-    return out.toIntArray()
+    val size = ranges.sumOf { it.count() }
+    val out = IntArray(size)
+    var p = 0
+    ranges.forEach { range ->
+        range.forEach { value -> out[p++] = value }
+    }
+    return out
 }

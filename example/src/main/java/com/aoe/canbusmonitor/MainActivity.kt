@@ -46,16 +46,34 @@ class MainActivity : Activity() {
     private lateinit var volumeSeek: SeekBar
     private lateinit var monitorScroll: ScrollView
     private var lastMonitorVersion = -1L
+    private var monitorUiLineCount = 0
     private var monitorPaused = false
     private var selectedTabIndex = 0
+    private var activityResumed = false
     private var storagePermissionDialogShown = false
     private var storageAccessWasGranted = false
 
     private val refresher = object : Runnable {
         override fun run() {
-            refreshMonitor()
-            refreshStatus()
-            handler.postDelayed(this, 400L)
+            if (!activityResumed) return
+            when (selectedTabIndex) {
+                0 -> if (!monitorPaused) {
+                    refreshMonitor()
+                    handler.postDelayed(this, 250L)
+                }
+                2 -> {
+                    refreshStatus()
+                    handler.postDelayed(this, 1000L)
+                }
+            }
+        }
+    }
+
+    private fun scheduleRefresher() {
+        handler.removeCallbacks(refresher)
+        if (!activityResumed) return
+        if ((selectedTabIndex == 0 && !monitorPaused) || selectedTabIndex == 2) {
+            handler.post(refresher)
         }
     }
 
@@ -85,6 +103,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        activityResumed = true
 
         val hasStorageAccess = hasPersistentStorageAccess()
         if (hasStorageAccess && !storageAccessWasGranted) {
@@ -103,12 +122,12 @@ class MainActivity : Activity() {
 
         MonitorCaptureState.enabled = selectedTabIndex == 0 && !monitorPaused
         sendServiceAction(TurnSignalService.ACTION_UPDATE_SUBSCRIPTIONS)
-        handler.removeCallbacks(refresher)
-        handler.post(refresher)
+        scheduleRefresher()
         renderRules()
     }
 
     override fun onPause() {
+        activityResumed = false
         MonitorCaptureState.enabled = false
         sendServiceAction(TurnSignalService.ACTION_UPDATE_SUBSCRIPTIONS)
         handler.removeCallbacks(refresher)
@@ -156,8 +175,10 @@ class MainActivity : Activity() {
                     if (pageIndex == 1) renderRules()
                     if (pageIndex == 0) {
                         lastMonitorVersion = -1L
-                        refreshMonitor()
+                        monitorUiLineCount = 0
                     }
+                    if (pageIndex == 2) refreshStatus()
+                    scheduleRefresher()
                 }
             }
             buttons += button
@@ -193,6 +214,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 MonitorStore.clear()
                 lastMonitorVersion = -1L
+                monitorUiLineCount = 0
                 refreshMonitor()
             }
         }
@@ -203,7 +225,11 @@ class MainActivity : Activity() {
                 text = if (monitorPaused) "TIẾP TỤC" else "TẠM DỪNG"
                 MonitorCaptureState.enabled = selectedTabIndex == 0 && !monitorPaused
                 sendServiceAction(TurnSignalService.ACTION_UPDATE_SUBSCRIPTIONS)
-                if (!monitorPaused) lastMonitorVersion = -1L
+                if (!monitorPaused) {
+                    lastMonitorVersion = -1L
+                    monitorUiLineCount = 0
+                }
+                scheduleRefresher()
             }
         }
         val filter = Button(this).apply {
@@ -569,6 +595,7 @@ class MainActivity : Activity() {
                 MonitorStore.configureFilter(mode, module, safeIndexes)
                 filterStatusText.text = "Bộ lọc log: ${MonitorStore.filterSummary()} • foreground Monitor mới mở rộng subscription; background chỉ giữ index rule"
                 lastMonitorVersion = -1L
+                monitorUiLineCount = 0
                 refreshMonitor()
                 sendServiceAction(TurnSignalService.ACTION_UPDATE_SUBSCRIPTIONS)
                 toast("Đã áp dụng: ${MonitorStore.filterSummary()}")
@@ -591,16 +618,44 @@ class MainActivity : Activity() {
     }
 
     private fun refreshMonitor() {
-        val latest = MonitorStore.latestRuleEvent
-        latestEventText.text = if (latest == null) {
-            "CANBUS/MAIN mới nhất: đang chờ..."
-        } else {
-            "CANBUS/MAIN mới nhất: ${latest.originalStyleLine()}"
+        if (!activityResumed || selectedTabIndex != 0 || monitorPaused) return
+        if (MonitorStore.version == lastMonitorVersion) return
+
+        latestEventText.text = MonitorStore.latestRuleLine?.let {
+            "CANBUS/MAIN mới nhất: $it"
+        } ?: "CANBUS/MAIN mới nhất: đang chờ..."
+
+        fun applyFullSnapshot() {
+            val snapshot = MonitorStore.takeUiSnapshot()
+            monitorText.text = if (snapshot.text.isBlank()) "Đang chờ dữ liệu FYT..." else snapshot.text
+            monitorUiLineCount = snapshot.lineCount
+            lastMonitorVersion = snapshot.version
         }
-        if (monitorPaused || MonitorStore.version == lastMonitorVersion) return
-        lastMonitorVersion = MonitorStore.version
-        val text = MonitorStore.snapshot()
-        monitorText.text = if (text.isBlank()) "Đang chờ dữ liệu FYT..." else text
+
+        if (lastMonitorVersion < 0L) {
+            applyFullSnapshot()
+        } else {
+            val batch = MonitorStore.drainUiBatch()
+            if (batch.requiresReset) {
+                applyFullSnapshot()
+            } else {
+                if (batch.lines.isNotEmpty()) {
+                    val addition = batch.lines.joinToString("\n")
+                    if (monitorUiLineCount == 0) {
+                        monitorText.text = addition
+                    } else {
+                        monitorText.append("\n")
+                        monitorText.append(addition)
+                    }
+                    monitorUiLineCount += batch.lines.size
+                }
+                lastMonitorVersion = batch.version
+
+                // Store vẫn giữ 2500 dòng. UI được phép append tới 3000 rồi rebuild một lần,
+                // thay vì rebuild toàn bộ sau mỗi event khi đã chạm giới hạn.
+                if (monitorUiLineCount > 3000) applyFullSnapshot()
+            }
+        }
         monitorScroll.post { monitorScroll.fullScroll(View.FOCUS_DOWN) }
     }
 

@@ -22,19 +22,33 @@ data class FytEvent(
     val strings: Array<String?>?,
     val timestamp: Long = System.currentTimeMillis()
 ) {
-    fun formattedPayload(): String {
-        val values = arrayListOf<String>()
-        ints?.forEach { values.add(it.toString()) }
+    /** Format một lượt, không tạo list/IntArray trung gian. */
+    fun formattedPayload(): String = buildString {
+        append('[')
+        var first = true
+        fun addValue(value: Any?) {
+            if (!first) append(", ")
+            append(value)
+            first = false
+        }
+
+        ints?.forEach { addValue(it) }
         if (ints != null) {
-            val unsigned = ints.map { it and 0xFF }.toIntArray()
-            if (!unsigned.contentEquals(ints)) {
-                values.add("//b")
-                unsigned.forEach { values.add(it.toString()) }
+            var unsignedDiffers = false
+            for (value in ints) {
+                if ((value and 0xFF) != value) {
+                    unsignedDiffers = true
+                    break
+                }
+            }
+            if (unsignedDiffers) {
+                addValue("//b")
+                ints.forEach { addValue(it and 0xFF) }
             }
         }
-        floats?.forEach { values.add(it.toString()) }
-        strings?.forEach { values.add(it ?: "null") }
-        return values.joinToString(", ", "[", "]")
+        floats?.forEach { addValue(it) }
+        strings?.forEach { addValue(it ?: "null") }
+        append(']')
     }
 
     fun originalStyleLine(): String = "$module:$index: ${formattedPayload()}"
@@ -46,10 +60,25 @@ enum class MonitorFilterMode {
     EXCLUDE_CAN_INDEX
 }
 
+data class MonitorUiBatch(
+    val version: Long,
+    val lines: List<String>,
+    val requiresReset: Boolean
+)
+
+data class MonitorUiSnapshot(
+    val version: Long,
+    val text: String,
+    val lineCount: Int
+)
+
 object MonitorStore {
     private const val MAX_LINES = 2500
+    private const val MAX_PENDING_UI_LINES = 1024
     private val lines = ArrayDeque<String>()
-    private val lastPayloads = ConcurrentHashMap<String, String>()
+    private val pendingUiLines = ArrayDeque<String>()
+    private val lastPayloads = HashMap<String, String>()
+    private var uiNeedsReset = true
 
     @Volatile private var filterMode: MonitorFilterMode = MonitorFilterMode.ALL
     @Volatile private var filterModule: String = RuleModule.CANBUS.name
@@ -60,6 +89,8 @@ object MonitorStore {
     @Volatile var latestCanEvent: FytEvent? = null
         private set
     @Volatile var latestRuleEvent: FytEvent? = null
+        private set
+    @Volatile var latestRuleLine: String? = null
         private set
 
     /** Fast-path: không lock, không tạo object mới. */
@@ -82,7 +113,6 @@ object MonitorStore {
         clearLocked()
     }
 
-    /** Backward-compatible overload cho code cũ. */
     fun configureFilter(mode: MonitorFilterMode, module: String, index: Int) {
         configureFilter(mode, module, setOf(index.coerceAtLeast(0)))
     }
@@ -105,19 +135,28 @@ object MonitorStore {
     fun accept(event: FytEvent): Boolean {
         if (!shouldQueueFast(event.module, event.index)) return false
 
+        // Payload chỉ format đúng một lần cho dedupe + line hiển thị.
         val payload = event.formattedPayload()
         val key = "${event.module}:${event.index}"
         val previous = lastPayloads.put(key, payload)
         if (previous == payload) return false
 
-        val line = event.originalStyleLine()
-        Log.i("FYT MODULE", line)
+        val line = "${event.module}:${event.index}: $payload"
         if (event.module == RuleModule.CANBUS.name) latestCanEvent = event
         if (event.module == RuleModule.CANBUS.name || event.module == RuleModule.MAIN.name) {
             latestRuleEvent = event
+            latestRuleLine = line
         }
+
         lines.addLast(line)
         while (lines.size > MAX_LINES) lines.removeFirst()
+
+        if (pendingUiLines.size >= MAX_PENDING_UI_LINES) {
+            pendingUiLines.clear()
+            uiNeedsReset = true
+        }
+        if (!uiNeedsReset) pendingUiLines.addLast(line)
+
         version++
         return true
     }
@@ -129,10 +168,38 @@ object MonitorStore {
 
     private fun clearLocked() {
         lines.clear()
+        pendingUiLines.clear()
         lastPayloads.clear()
         latestCanEvent = null
         latestRuleEvent = null
+        latestRuleLine = null
+        uiNeedsReset = true
         version++
+    }
+
+    /** Snapshot đầy đủ chỉ dùng lúc mở/rebuild Monitor hoặc export. */
+    @Synchronized
+    fun takeUiSnapshot(): MonitorUiSnapshot {
+        val result = MonitorUiSnapshot(
+            version = version,
+            text = lines.joinToString("\n"),
+            lineCount = lines.size
+        )
+        pendingUiLines.clear()
+        uiNeedsReset = false
+        return result
+    }
+
+    /** Lấy riêng các dòng mới kể từ lần UI drain trước. */
+    @Synchronized
+    fun drainUiBatch(): MonitorUiBatch {
+        if (uiNeedsReset) {
+            pendingUiLines.clear()
+            return MonitorUiBatch(version, emptyList(), true)
+        }
+        val out = if (pendingUiLines.isEmpty()) emptyList() else pendingUiLines.toList()
+        pendingUiLines.clear()
+        return MonitorUiBatch(version, out, false)
     }
 
     @Synchronized
@@ -568,7 +635,29 @@ class RuleEngine(
     initialHoldMillis: Long = DEFAULT_HOLD_MS,
     private val onStateChanged: (RuleStateSnapshot) -> Unit
 ) {
-    private val handler = Handler(Looper.getMainLooper())
+    /**
+     * State callback được xếp hàng trên worker riêng. Vì enqueue diễn ra khi đang giữ lock RuleEngine,
+     * thứ tự BẬT/TẮT vẫn được bảo toàn nhưng AudioTrack/Notification không còn giữ lock CAN hot-path.
+     */
+    private val stateExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "FYT-RuleState").apply {
+            isDaemon = true
+            priority = (Thread.NORM_PRIORITY + 1).coerceAtMost(Thread.MAX_PRIORITY)
+        }
+    }
+
+    /** ScheduledThreadPoolExecutor chỉ tạo thread khi TIMEOUT thực sự cần dùng. TRIGGER không tốn timer thread. */
+    private val timeoutScheduler = java.util.concurrent.ScheduledThreadPoolExecutor(
+        1,
+        java.util.concurrent.ThreadFactory { runnable ->
+            Thread(runnable, "FYT-RuleTimeout").apply {
+                isDaemon = true
+                priority = Thread.NORM_PRIORITY
+            }
+        }
+    ).apply {
+        setRemoveOnCancelPolicy(true)
+    }
 
     @Volatile private var rulesSnapshot: List<CanRule> = emptyList()
     @Volatile private var canRulesByIndex: Map<Int, Array<CanRule>> = emptyMap()
@@ -579,8 +668,8 @@ class RuleEngine(
     private val targetActive = BooleanArray(SignalTarget.values().size)
     private val lastMatchElapsed = LongArray(SignalTarget.values().size)
     private var activeCount = 0
-    private var watchdogScheduled = false
-    private val watchdogRunnable = Runnable { handleWatchdog() }
+    private var timeoutFuture: java.util.concurrent.ScheduledFuture<*>? = null
+    private var released = false
 
     @Volatile var active: Boolean = false
         private set
@@ -597,7 +686,7 @@ class RuleEngine(
     fun setStopMode(mode: StopMode) {
         if (stopMode == mode) return
         stopMode = mode
-        clearStateLocked()
+        clearStateLocked(true)
         rebuildRuleIndexesLocked()
     }
 
@@ -606,7 +695,7 @@ class RuleEngine(
         val safe = value.coerceIn(0L, MAX_HOLD_MS)
         if (holdMillis == safe) return
         holdMillis = safe
-        if (stopMode == StopMode.TIMEOUT) clearStateLocked()
+        if (stopMode == StopMode.TIMEOUT) clearStateLocked(true)
     }
 
     @Synchronized
@@ -614,7 +703,7 @@ class RuleEngine(
         val copied = newRules.map { it.copy() }
         if (copied == rulesSnapshot) return
         rulesSnapshot = copied
-        clearStateLocked()
+        clearStateLocked(true)
         rebuildRuleIndexesLocked()
     }
 
@@ -634,6 +723,7 @@ class RuleEngine(
 
     @Synchronized
     fun onRawEvent(module: String, index: Int, values: IntArray?) {
+        if (released) return
         val relevantRules = when (module) {
             RuleModule.CANBUS.name -> canRulesByIndex[index]
             RuleModule.MAIN.name -> mainRulesByIndex[index]
@@ -643,7 +733,7 @@ class RuleEngine(
 
         var stoppedMask = 0
         var stateChanged = false
-        val now = SystemClock.elapsedRealtime()
+        val now = if (stopMode == StopMode.TIMEOUT) SystemClock.elapsedRealtime() else 0L
 
         if (stopMode == StopMode.TRIGGER) {
             for (rule in relevantRules) {
@@ -675,9 +765,10 @@ class RuleEngine(
             stateChanged = true
         }
 
-        if (stateChanged) emitStateLocked()
+        if (stateChanged) queueStateLocked()
         if (stopMode == StopMode.TIMEOUT && activeCount > 0) {
-            scheduleWatchdogLocked(watchdogDelayLocked())
+            // Không polling 100 ms nữa; đặt đúng mốc timeout gần nhất.
+            rescheduleTimeoutLocked()
         }
     }
 
@@ -691,39 +782,29 @@ class RuleEngine(
 
     @Synchronized
     fun clearState() {
-        clearStateLocked()
+        clearStateLocked(true)
     }
 
-    private fun clearStateLocked() {
-        handler.removeCallbacks(watchdogRunnable)
-        watchdogScheduled = false
-        val changed = activeCount > 0
+    private fun clearStateLocked(notify: Boolean) {
+        cancelTimeoutLocked()
+        val changed = activeCount > 0 || active
         activeCount = 0
         for (i in targetActive.indices) {
             targetActive[i] = false
             lastMatchElapsed[i] = 0L
         }
         active = false
-        if (changed) emitStateLocked()
+        if (changed && notify) queueStateLocked()
     }
 
     @Synchronized
-    fun release() {
-        clearStateLocked()
-        rulesSnapshot = emptyList()
-        canRulesByIndex = emptyMap()
-        mainRulesByIndex = emptyMap()
-    }
-
-    @Synchronized
-    private fun handleWatchdog() {
-        watchdogScheduled = false
-        if (stopMode != StopMode.TIMEOUT || activeCount <= 0) return
+    private fun handleTimeout() {
+        timeoutFuture = null
+        if (released || stopMode != StopMode.TIMEOUT || activeCount <= 0) return
 
         val now = SystemClock.elapsedRealtime()
         var changed = false
-        for (target in SignalTarget.values()) {
-            val i = target.ordinal
+        for (i in targetActive.indices) {
             if (!targetActive[i]) continue
             if (now - lastMatchElapsed[i] >= holdMillis) {
                 targetActive[i] = false
@@ -733,35 +814,71 @@ class RuleEngine(
             }
         }
 
-        if (changed) emitStateLocked()
-        if (activeCount > 0) scheduleWatchdogLocked(watchdogDelayLocked())
+        if (changed) queueStateLocked()
+        if (activeCount > 0) rescheduleTimeoutLocked()
     }
 
-    private fun watchdogDelayLocked(): Long {
-        return if (holdMillis <= 0L) 0L else minOf(WATCHDOG_INTERVAL_MS, holdMillis)
-    }
+    private fun rescheduleTimeoutLocked() {
+        cancelTimeoutLocked()
+        if (released || stopMode != StopMode.TIMEOUT || activeCount <= 0) return
 
-    private fun scheduleWatchdogLocked(delayMillis: Long) {
-        if (watchdogScheduled) return
-        watchdogScheduled = true
-        handler.postDelayed(watchdogRunnable, delayMillis)
-    }
+        val now = SystemClock.elapsedRealtime()
+        var nearestDeadline = Long.MAX_VALUE
+        for (i in targetActive.indices) {
+            if (!targetActive[i]) continue
+            val deadline = lastMatchElapsed[i] + holdMillis
+            if (deadline < nearestDeadline) nearestDeadline = deadline
+        }
+        if (nearestDeadline == Long.MAX_VALUE) return
 
-    private fun emitStateLocked() {
-        active = activeCount > 0
-        onStateChanged(
-            RuleStateSnapshot(
-                left = targetActive[SignalTarget.LEFT.ordinal],
-                right = targetActive[SignalTarget.RIGHT.ordinal],
-                hazard = targetActive[SignalTarget.HAZARD.ordinal]
-            )
+        val delay = (nearestDeadline - now).coerceAtLeast(0L)
+        timeoutFuture = timeoutScheduler.schedule(
+            { handleTimeout() },
+            delay,
+            java.util.concurrent.TimeUnit.MILLISECONDS
         )
+    }
+
+    private fun cancelTimeoutLocked() {
+        timeoutFuture?.cancel(false)
+        timeoutFuture = null
+    }
+
+    /** Chỉ snapshot + enqueue trong lock; callback thật chạy ngoài lock trên FYT-RuleState. */
+    private fun queueStateLocked() {
+        active = activeCount > 0
+        val snapshot = RuleStateSnapshot(
+            left = targetActive[SignalTarget.LEFT.ordinal],
+            right = targetActive[SignalTarget.RIGHT.ordinal],
+            hazard = targetActive[SignalTarget.HAZARD.ordinal]
+        )
+        try {
+            stateExecutor.execute {
+                try {
+                    onStateChanged(snapshot)
+                } catch (_: Throwable) {
+                    // Không để callback audio/UI làm chết rule worker.
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+        }
+    }
+
+    @Synchronized
+    fun release() {
+        if (released) return
+        released = true
+        clearStateLocked(false)
+        rulesSnapshot = emptyList()
+        canRulesByIndex = emptyMap()
+        mainRulesByIndex = emptyMap()
+        timeoutScheduler.shutdownNow()
+        stateExecutor.shutdownNow()
     }
 
     companion object {
         private const val DEFAULT_HOLD_MS = 1500L
         private const val MAX_HOLD_MS = 2000L
-        private const val WATCHDOG_INTERVAL_MS = 100L
     }
 }
 

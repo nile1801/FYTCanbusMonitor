@@ -7,7 +7,9 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import com.aoe.fytcanbusmonitor.ConnectionObserver
 import com.aoe.fytcanbusmonitor.IRemoteToolkit
 import com.aoe.fytcanbusmonitor.ModuleCodes.MODULE_CODE_BT
@@ -22,11 +24,23 @@ class TurnSignalService : Service() {
     private var mainSubscription: DynamicModuleSubscription? = null
     private var btSubscription: DynamicModuleSubscription? = null
     private var canSubscription: DynamicModuleSubscription? = null
+
     private var currentRules: List<CanRule> = emptyList()
+    private var currentStopMode: StopMode = StopMode.TIMEOUT
+    private var soundEnabled = true
+    private var ruleCanIndexes: Set<Int> = emptySet()
+    private var ruleMainIndexes: Set<Int> = emptySet()
 
     private val monitorMainIndexes = concatRanges(0..76, 78..200)
     private val monitorBtIndexes = concatRanges(0..100)
     private val monitorCanIndexes = concatRanges(0..200, 500..600, 1000..1200)
+    private val monitorMainSet = monitorMainIndexes.toSet()
+    private val monitorBtSet = monitorBtIndexes.toSet()
+    private val monitorCanSet = monitorCanIndexes.toSet()
+
+    private val notificationHandler = Handler(Looper.getMainLooper())
+    private val notificationRunnable = Runnable { updateNotificationNow() }
+    private var lastNotificationStatus: String? = null
 
     @Volatile private var destroying = false
 
@@ -34,15 +48,16 @@ class TurnSignalService : Service() {
         override fun onConnected(toolkit: IRemoteToolkit?) {
             RuntimeState.fytConnected = toolkit != null
             if (RuntimeState.audioReady) RuntimeState.lastError = null
-            updateNotification()
+            scheduleNotificationUpdate()
         }
 
         override fun onDisconnected() {
             RuntimeState.fytConnected = false
             if (!destroying) {
                 ruleEngine.clearState()
+                // Dừng ngay cả trước khi state worker chạy callback false.
                 audio.stopRule()
-                updateNotification()
+                scheduleNotificationUpdate()
             }
         }
     }
@@ -59,7 +74,14 @@ class TurnSignalService : Service() {
         )
 
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification())
+        val initialStatus = notificationStatus()
+        lastNotificationStatus = initialStatus
+        startForeground(NOTIFICATION_ID, buildNotification(initialStatus))
+
+        // RuleStore.load có thể restore stopMode/timeout từ rules.json.
+        currentRules = RuleStore.load(this)
+        currentStopMode = SettingsStore.stopMode(this)
+        soundEnabled = SettingsStore.isEnabled(this)
 
         audio = AudioEngine(this)
         ruleEngine = RuleEngine(SettingsStore.timeoutMillis(this).toLong()) { state ->
@@ -67,20 +89,22 @@ class TurnSignalService : Service() {
             RuntimeState.rightActive = state.right
             RuntimeState.hazardActive = state.hazard
             RuntimeState.ruleActive = state.anyActive
-            audio.setRuleActive(state.anyActive && SettingsStore.isEnabled(this))
-            updateNotification()
+            // Đây chạy trên FYT-RuleState, không còn giữ lock RuleEngine/Binder callback.
+            audio.setRuleActive(state.anyActive && soundEnabled)
+            scheduleNotificationUpdate()
         }
-        currentRules = RuleStore.load(this)
         ruleEngine.setHoldMillis(SettingsStore.timeoutMillis(this).toLong())
-        ruleEngine.setStopMode(SettingsStore.stopMode(this))
+        ruleEngine.setStopMode(currentStopMode)
         ruleEngine.setRules(currentRules)
+        rebuildRuleSubscriptionIndexes()
+        scheduleNotificationUpdate()
 
         if (RuntimeState.fytPackagePresent) {
             connectToFyt()
         } else {
             RuntimeState.fytConnected = false
             if (RuntimeState.audioReady) RuntimeState.lastError = null
-            updateNotification()
+            scheduleNotificationUpdate()
         }
     }
 
@@ -112,9 +136,7 @@ class TurnSignalService : Service() {
         observers += btSubscription!!
         observers += canSubscription!!
 
-        // Chốt desired indexes trước khi kết nối; onConnected chỉ apply đúng tập hiện tại.
         updateSubscriptions()
-
         observers.forEach { MsToolkitConnection.instance.addObserver(it) }
         try {
             MsToolkitConnection.instance.connect(applicationContext)
@@ -122,7 +144,7 @@ class TurnSignalService : Service() {
             if (RuntimeState.audioReady) {
                 RuntimeState.lastError = "Kết nối FYT: ${t.javaClass.simpleName}: ${t.message}"
             }
-            updateNotification()
+            scheduleNotificationUpdate()
         }
     }
 
@@ -152,7 +174,8 @@ class TurnSignalService : Service() {
                 audio.stopRule()
                 stopSelf()
             }
-            else -> refreshConfiguration()
+            // onCreate đã load toàn bộ config. Start bình thường/null không đọc JSON/prefs lại lần 2.
+            else -> Unit
         }
         return START_STICKY
     }
@@ -164,73 +187,71 @@ class TurnSignalService : Service() {
             SettingsStore.monitorFilterIndexes(this)
         )
         currentRules = RuleStore.load(this)
+        currentStopMode = SettingsStore.stopMode(this)
+        soundEnabled = SettingsStore.isEnabled(this)
+
         ruleEngine.setHoldMillis(SettingsStore.timeoutMillis(this).toLong())
-        ruleEngine.setStopMode(SettingsStore.stopMode(this))
+        ruleEngine.setStopMode(currentStopMode)
         ruleEngine.setRules(currentRules)
         audio.setVolume(SettingsStore.volume(this))
+        rebuildRuleSubscriptionIndexes()
         updateSubscriptions()
 
-        if (SettingsStore.isEnabled(this) && ruleEngine.active) {
+        if (soundEnabled && ruleEngine.active) {
             audio.setRuleActive(true)
         } else {
             audio.stopRule()
         }
-        updateNotification()
+        scheduleNotificationUpdate()
+    }
+
+    /** TIMEOUT không cần subscribe STOP-only index; TRIGGER cần cả START + STOP. */
+    private fun rebuildRuleSubscriptionIndexes() {
+        val eligible = currentRules.asSequence().filter {
+            it.enabled && (currentStopMode == StopMode.TRIGGER || it.action == RuleAction.START)
+        }
+        val can = linkedSetOf<Int>()
+        val main = linkedSetOf<Int>()
+        eligible.forEach { rule ->
+            if (rule.index < 0) return@forEach
+            if (rule.module == RuleModule.MAIN) main += rule.index else can += rule.index
+        }
+        ruleCanIndexes = can
+        ruleMainIndexes = main
     }
 
     /**
-     * Background / tab khác / Monitor pause:
-     *   chỉ subscribe index thật sự có trong enabled CANBUS/MAIN rules.
-     *
-     * Monitor foreground:
-     *   subscribe rule indexes + phần monitor cần theo filter đã lưu.
-     *   ALL     -> full monitor ranges
-     *   ONLY    -> chỉ các index filter của đúng module
-     *   EXCLUDE -> full ranges trừ index filter của đúng module
-     *
-     * Rule indexes luôn được union trở lại, nên filter log không bao giờ làm mất trigger âm thanh.
+     * Background/tab khác/Monitor pause: chỉ rule indexes, không đọc filter prefs.
+     * Monitor foreground: union rule indexes với phạm vi monitor theo filter đã lưu.
      */
     private fun updateSubscriptions() {
-        val ruleCan = currentRules.asSequence()
-            .filter { it.enabled && it.module == RuleModule.CANBUS }
-            .map { it.index }
-            .filter { it >= 0 }
-            .toSet()
-        val ruleMain = currentRules.asSequence()
-            .filter { it.enabled && it.module == RuleModule.MAIN }
-            .map { it.index }
-            .filter { it >= 0 }
-            .toSet()
+        if (!MonitorCaptureState.enabled) {
+            mainSubscription?.setIndexes(ruleMainIndexes.sorted().toIntArray())
+            canSubscription?.setIndexes(ruleCanIndexes.sorted().toIntArray())
+            btSubscription?.setIndexes(IntArray(0))
+            return
+        }
 
-        val monitorEnabled = MonitorCaptureState.enabled
         val mode = SettingsStore.monitorFilterMode(this)
         val filterModule = SettingsStore.monitorFilterModule(this)
         val filterIndexes = SettingsStore.monitorFilterIndexes(this)
 
-        fun monitorIndexes(module: String, fullRange: IntArray): Set<Int> {
-            if (!monitorEnabled) return emptySet()
+        fun monitorIndexes(module: String, fullRange: Set<Int>): Set<Int> {
             return when (mode) {
-                MonitorFilterMode.ALL -> fullRange.toSet()
+                MonitorFilterMode.ALL -> fullRange
                 MonitorFilterMode.ONLY_CAN_INDEX ->
                     if (module == filterModule) filterIndexes else emptySet()
                 MonitorFilterMode.EXCLUDE_CAN_INDEX ->
-                    if (module == filterModule) {
-                        fullRange.asSequence().filter { it !in filterIndexes }.toSet()
-                    } else {
-                        fullRange.toSet()
-                    }
+                    if (module == filterModule) fullRange.filterTo(linkedSetOf()) { it !in filterIndexes }
+                    else fullRange
             }
         }
 
-        val mainWanted = (ruleMain + monitorIndexes(RuleModule.MAIN.name, monitorMainIndexes))
-            .sorted()
-            .toIntArray()
-        val canWanted = (ruleCan + monitorIndexes(RuleModule.CANBUS.name, monitorCanIndexes))
-            .sorted()
-            .toIntArray()
-        val btWanted = monitorIndexes("BT", monitorBtIndexes)
-            .sorted()
-            .toIntArray()
+        val mainWanted = (ruleMainIndexes + monitorIndexes(RuleModule.MAIN.name, monitorMainSet))
+            .sorted().toIntArray()
+        val canWanted = (ruleCanIndexes + monitorIndexes(RuleModule.CANBUS.name, monitorCanSet))
+            .sorted().toIntArray()
+        val btWanted = monitorIndexes("BT", monitorBtSet).sorted().toIntArray()
 
         mainSubscription?.setIndexes(mainWanted)
         canSubscription?.setIndexes(canWanted)
@@ -239,8 +260,10 @@ class TurnSignalService : Service() {
 
     override fun onDestroy() {
         destroying = true
+        notificationHandler.removeCallbacks(notificationRunnable)
         observers.forEach { MsToolkitConnection.instance.removeObserver(it) }
         observers.clear()
+        if (::audio.isInitialized) audio.stopRule()
         if (::ruleEngine.isInitialized) ruleEngine.release()
         if (::audio.isInitialized) audio.release()
         RuntimeState.serviceRunning = false
@@ -268,21 +291,21 @@ class TurnSignalService : Service() {
         nm.createNotificationChannel(channel)
     }
 
-    private fun buildNotification(): Notification {
-        val openIntent = Intent(this, MainActivity::class.java)
+    private fun notificationStatus(): String = when {
+        !RuntimeState.audioReady -> "Audio chưa sẵn sàng"
+        !RuntimeState.fytPackagePresent -> "Chế độ thử điện thoại • audio đã sẵn sàng"
+        !RuntimeState.fytConnected -> "Đang chờ dịch vụ FYT"
+        RuntimeState.ruleActive && soundEnabled -> "FYT rule đang active • âm xi nhan đang phát"
+        else -> "Đã kết nối FYT • đang giám sát rule"
+    }
+
+    private fun buildNotification(status: String): Notification {
         val pending = PendingIntent.getActivity(
             this,
             0,
-            openIntent,
+            Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        val status = when {
-            !RuntimeState.audioReady -> "Audio chưa sẵn sàng"
-            !RuntimeState.fytPackagePresent -> "Chế độ thử điện thoại • audio đã sẵn sàng"
-            !RuntimeState.fytConnected -> "Đang chờ dịch vụ FYT"
-            RuntimeState.ruleActive && SettingsStore.isEnabled(this) -> "FYT rule đang active • âm xi nhan đang phát"
-            else -> "Đã kết nối FYT • đang giám sát rule"
-        }
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_more)
             .setContentTitle("FYT Turn Sound")
@@ -294,9 +317,21 @@ class TurnSignalService : Service() {
             .build()
     }
 
-    private fun updateNotification() {
+    /** Chỉ post một update; nhiều state đổi sát nhau được gộp, không block Binder/rule worker. */
+    private fun scheduleNotificationUpdate() {
+        notificationHandler.removeCallbacks(notificationRunnable)
+        notificationHandler.post(notificationRunnable)
+    }
+
+    private fun updateNotificationNow() {
+        val status = notificationStatus()
+        if (status == lastNotificationStatus) return
+        lastNotificationStatus = status
         try {
-            getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification())
+            getSystemService(NotificationManager::class.java).notify(
+                NOTIFICATION_ID,
+                buildNotification(status)
+            )
         } catch (_: Throwable) {
         }
     }

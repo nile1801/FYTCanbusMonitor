@@ -8,16 +8,19 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
-import java.util.*
+import java.util.ArrayList
+import java.util.concurrent.ThreadLocalRandom
 
 class MsToolkitConnection private constructor() : ServiceConnection {
-    private var mConnecting = false
-    private var mContext: Context? = null
-    var remoteToolkit: IRemoteToolkit? = null
+    @Volatile private var mConnecting = false
+    @Volatile private var mContext: Context? = null
+    @Volatile var remoteToolkit: IRemoteToolkit? = null
         private set
-    private val mHandler: Handler = Handler(Looper.getMainLooper())
-    private val mConnectionObservers: ArrayList<ConnectionObserver> = ArrayList()
-    private val mRunnableConnect: Runnable = object : Runnable {
+
+    private val mHandler = Handler(requireNotNull(looper))
+    private val mConnectionObservers = ArrayList<ConnectionObserver>()
+
+    private val mRunnableConnect = object : Runnable {
         override fun run() {
             if (remoteToolkit != null) {
                 mConnecting = false
@@ -27,30 +30,27 @@ class MsToolkitConnection private constructor() : ServiceConnection {
             val intent = Intent("com.syu.ms.toolkit").apply {
                 component = ComponentName("com.syu.ms", "app.ToolkitService")
             }
-
             try {
-                // Some non-FYT Android builds throw instead of simply returning false when
-                // the explicit service component does not exist or cannot be bound.
                 mContext?.bindService(intent, instance, Context.BIND_AUTO_CREATE)
             } catch (_: SecurityException) {
-                // Keep retry semantics for FYT boot races without crashing the host app.
             } catch (_: IllegalArgumentException) {
             } catch (_: Throwable) {
             }
 
-            mHandler.postDelayed(this, Random().nextInt(3000) + 1000L)
+            if (remoteToolkit == null) {
+                mHandler.postDelayed(this, randomReconnectDelay())
+            }
         }
     }
 
     companion object {
+        private val connectionThread = HandlerThread("FYT-Connection").apply { start() }
+        var looper: Looper? = connectionThread.looper
+            private set
         val instance = MsToolkitConnection()
-        var looper: Looper? = null
 
-        init {
-            val thread = HandlerThread("ConnectionThread")
-            thread.start()
-            looper = thread.looper
-        }
+        private fun randomReconnectDelay(): Long =
+            ThreadLocalRandom.current().nextLong(1000L, 4001L)
     }
 
     @Synchronized
@@ -58,114 +58,73 @@ class MsToolkitConnection private constructor() : ServiceConnection {
         connect(context, 0L)
     }
 
+    @Synchronized
     private fun connect(context: Context?, delayMillis: Long) {
         if (!mConnecting && remoteToolkit == null && context != null) {
             mContext = context.applicationContext
             mConnecting = true
+            mHandler.removeCallbacks(mRunnableConnect)
             mHandler.postDelayed(mRunnableConnect, delayMillis)
         }
     }
 
     @Synchronized
     fun addObserver(observer: ConnectionObserver?) {
-        if (observer != null) {
-            if (!mConnectionObservers.contains(observer)) {
-                mConnectionObservers.add(observer)
-                if (remoteToolkit != null) {
-                    mHandler.post(OnServiceConnected(this, observer, null))
-                }
-            }
+        if (observer == null || mConnectionObservers.contains(observer)) return
+        mConnectionObservers.add(observer)
+        val toolkit = remoteToolkit
+        if (toolkit != null) {
+            mHandler.post { observer.onConnected(toolkit) }
         }
     }
 
     @Synchronized
     fun removeObserver(observer: ConnectionObserver?) {
-        if (observer != null) {
-            mConnectionObservers.remove(observer)
-        }
+        if (observer == null) return
+        mConnectionObservers.remove(observer)
         if (remoteToolkit != null) {
-            mHandler.post(OnServiceDisconnected(this, observer, null))
+            mHandler.post { observer.onDisconnected() }
         }
     }
 
     @Synchronized
     fun clearObservers() {
-        if (remoteToolkit != null) {
-            val it: Iterator<ConnectionObserver> = mConnectionObservers.iterator()
-            while (it.hasNext()) {
-                val observer: ConnectionObserver = it.next()
-                mHandler.post(OnServiceDisconnected(this, observer, null))
-            }
-        }
+        val current = if (remoteToolkit != null) mConnectionObservers.toList() else emptyList()
         mConnectionObservers.clear()
+        current.forEach { observer -> mHandler.post { observer.onDisconnected() } }
     }
 
-    @Synchronized
     override fun onServiceConnected(name: ComponentName, service: IBinder) {
-        remoteToolkit = IRemoteToolkit.Stub.asInterface(service)
-        val it: Iterator<ConnectionObserver> = mConnectionObservers.iterator()
-        while (it.hasNext()) {
-            val observer: ConnectionObserver = it.next()
-            mHandler.post(OnServiceConnected(this, observer, null))
+        val toolkit = IRemoteToolkit.Stub.asInterface(service)
+        val observers: List<ConnectionObserver>
+        synchronized(this) {
+            remoteToolkit = toolkit
+            mConnecting = false
+            mHandler.removeCallbacks(mRunnableConnect)
+            observers = mConnectionObservers.toList()
         }
-    }
-
-    @Synchronized
-    override fun onServiceDisconnected(name: ComponentName) {
-        remoteToolkit = null
-        val it: Iterator<ConnectionObserver> = mConnectionObservers.iterator()
-        while (it.hasNext()) {
-            val observer: ConnectionObserver = it.next()
-            mHandler.post(OnServiceDisconnected(this, observer, null))
-        }
-        mConnecting = false
-        connect(mContext, Random().nextInt(3000) + 1000L)
-    }
-
-    override fun onBindingDied(name: ComponentName) {
-        onServiceDisconnected(name)
-    }
-
-    override fun onNullBinding(name: ComponentName) {
-        onServiceDisconnected(name)
-    }
-
-    inner class OnServiceConnected private constructor(observer: ConnectionObserver) : Runnable {
-        private val observer: ConnectionObserver?
-
-        internal constructor(
-            msToolkitConnection: MsToolkitConnection?,
-            connectionObserver: ConnectionObserver,
-            onServiceConnected: OnServiceConnected?
-        ) : this(connectionObserver)
-
-        override fun run() {
-            val toolkit = remoteToolkit
-            if (toolkit != null && observer != null) {
-                observer.onConnected(toolkit)
+        observers.forEach { observer ->
+            mHandler.post {
+                val current = remoteToolkit
+                if (current != null) observer.onConnected(current)
             }
         }
-
-        init {
-            this.observer = observer
-        }
     }
 
-    private inner class OnServiceDisconnected private constructor(observer: ConnectionObserver?) : Runnable {
-        private val observer: ConnectionObserver?
-
-        internal constructor(
-            msToolkitConnection: MsToolkitConnection?,
-            connectionObserver: ConnectionObserver?,
-            onServiceDisconnected: OnServiceDisconnected?
-        ) : this(connectionObserver)
-
-        override fun run() {
-            observer?.onDisconnected()
+    override fun onServiceDisconnected(name: ComponentName) {
+        val observers: List<ConnectionObserver>
+        val context: Context?
+        synchronized(this) {
+            remoteToolkit = null
+            mConnecting = false
+            mHandler.removeCallbacks(mRunnableConnect)
+            observers = mConnectionObservers.toList()
+            context = mContext
         }
-
-        init {
-            this.observer = observer
-        }
+        observers.forEach { observer -> mHandler.post { observer.onDisconnected() } }
+        connect(context, randomReconnectDelay())
     }
+
+    override fun onBindingDied(name: ComponentName) = onServiceDisconnected(name)
+    override fun onNullBinding(name: ComponentName) = onServiceDisconnected(name)
 }

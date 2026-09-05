@@ -149,7 +149,6 @@ class AudioEngine(private val context: Context) {
                 if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
                 synchronized(wakeLock) { wakeLock.notifyAll() }
                 RuntimeState.lastError = null
-                Log.d(TAG, "Audio playback ON")
             } catch (t: Throwable) {
                 playbackRequested = false
                 RuntimeState.lastError = "Audio PLAY: ${t.javaClass.simpleName}: ${t.message}"
@@ -158,7 +157,6 @@ class AudioEngine(private val context: Context) {
         } else {
             pauseAndFlushTrack()
             synchronized(wakeLock) { wakeLock.notifyAll() }
-            Log.d(TAG, "Audio playback OFF")
         }
     }
 
@@ -224,7 +222,7 @@ class AudioEngine(private val context: Context) {
                 synchronized(wakeLock) {
                     if (!released && !playbackRequested) {
                         try {
-                            wakeLock.wait(500L)
+                            wakeLock.wait()
                         } catch (_: InterruptedException) {
                         }
                     }
@@ -494,7 +492,7 @@ class AudioEngine(private val context: Context) {
 
     /** Nhân biên độ PCM thật. Nếu vượt 16-bit thì clamp để không integer overflow. */
     private fun applyDigitalGain(source: ShortArray, gainValue: Float): ShortArray {
-        if (gainValue == 1f) return source.copyOf()
+        if (gainValue == 1f) return source
         if (gainValue == 0f) return ShortArray(source.size)
         return ShortArray(source.size) { i ->
             val scaled = (source[i].toFloat() * gainValue).roundToInt()
