@@ -65,13 +65,19 @@ object MonitorStore {
     @Volatile var latestCanEvent: FytEvent? = null
         private set
 
-    private fun shouldKeep(event: FytEvent): Boolean {
+    /**
+     * Fast-path dùng ngay trong Binder callback, trước khi copy array/tạo FytEvent/Runnable.
+     * Các field filter đều volatile nên phép kiểm tra này không cần lock.
+     */
+    fun shouldQueueFast(module: String, index: Int): Boolean {
         return when (filterMode) {
             MonitorFilterMode.ALL -> true
-            MonitorFilterMode.ONLY_CAN_INDEX -> event.module == "CANBUS" && event.index == filterIndex
-            MonitorFilterMode.EXCLUDE_CAN_INDEX -> !(event.module == "CANBUS" && event.index == filterIndex)
+            MonitorFilterMode.ONLY_CAN_INDEX -> module == "CANBUS" && index == filterIndex
+            MonitorFilterMode.EXCLUDE_CAN_INDEX -> !(module == "CANBUS" && index == filterIndex)
         }
     }
+
+    private fun shouldKeep(event: FytEvent): Boolean = shouldQueueFast(event.module, event.index)
 
     @Synchronized
     fun configureFilter(mode: MonitorFilterMode, index: Int) {
@@ -93,7 +99,7 @@ object MonitorStore {
 
     @Synchronized
     fun accept(event: FytEvent): Boolean {
-        // Kiểm tra filter trước khi format payload để event bị loại gần như không tốn CPU.
+        // Re-check vì filter có thể đổi sau khi event đã vào queue.
         if (!shouldKeep(event)) return false
 
         val payload = event.formattedPayload()
@@ -230,34 +236,49 @@ object SettingsStore {
 }
 
 /**
- * RuleEngine ưu tiên phản hồi tức thì khi thấy frame match.
+ * RuleEngine tối ưu cho CANBUS có tần suất cao.
  *
- * Nhiều CANBOX phát frame trạng thái theo đúng nhịp chớp của bóng xi nhan: frame match rồi
- * frame không match xen kẽ. Nếu stop ngay ở frame không match thì audio bị cắt thành từng đoạn.
- * Vì vậy sau mỗi frame match, trạng thái active được giữ thêm một khoảng ngắn. Frame match kế tiếp
- * chỉ gia hạn thời hạn này; AudioEngine sẽ giữ nguyên một SoundPool stream, không play lại.
+ * - Rule được index sẵn theo CANBUS:index để lookup O(1), không scan toàn bộ danh sách mỗi frame.
+ * - Index không có rule đang bật sẽ return ngay.
+ * - Khi đã active=true, frame match tiếp theo chỉ cập nhật heartbeat lastMatchElapsed rồi return;
+ *   không gọi lại AudioEngine và không remove/post timer theo từng frame.
+ * - Một watchdog độc lập kiểm tra định kỳ. Chỉ khi không còn frame MATCH trong holdMillis thì
+ *   active mới chuyển false. Frame OFF xen giữa các nhịp chớp không làm tiếng bị cắt.
  */
 class RuleEngine(
     private val holdMillis: Long = DEFAULT_HOLD_MS,
     private val onActiveChanged: (Boolean) -> Unit
 ) {
     private val handler = Handler(Looper.getMainLooper())
-    @Volatile private var rules: List<CanRule> = emptyList()
+
+    @Volatile private var rulesSnapshot: List<CanRule> = emptyList()
+    @Volatile private var rulesByIndex: Map<Int, Array<CanRule>> = emptyMap()
+
     @Volatile var active: Boolean = false
         private set
 
     private var lastMatchElapsed: Long = 0L
-    private val stopRunnable = Runnable { handleHoldTimeout() }
+    private var watchdogScheduled = false
+    private val watchdogRunnable = Runnable { handleWatchdog() }
+
+    /** Fast-path cho Binder callback: O(1), không tạo object. */
+    fun hasRuleForIndex(index: Int): Boolean = rulesByIndex[index] != null
 
     @Synchronized
     fun setRules(newRules: List<CanRule>) {
         val copied = newRules.map { it.copy() }
-        if (copied == rules) return
-        rules = copied
+        if (copied == rulesSnapshot) return
 
-        // Thay luật là một thay đổi cấu hình thực sự: bỏ latch cũ để không giữ âm thanh
-        // bởi một rule đã bị sửa/xóa. Các lần refresh cùng bộ rule không gây gián đoạn.
-        handler.removeCallbacks(stopRunnable)
+        rulesSnapshot = copied
+        rulesByIndex = copied
+            .asSequence()
+            .filter { it.enabled }
+            .groupBy { it.index }
+            .mapValues { (_, list) -> list.toTypedArray() }
+
+        // Đổi cấu hình rule là thay đổi thật: bỏ trạng thái cũ để không giữ tiếng bởi rule đã sửa/xóa.
+        handler.removeCallbacks(watchdogRunnable)
+        watchdogScheduled = false
         lastMatchElapsed = 0L
         setActiveLocked(false)
     }
@@ -265,34 +286,45 @@ class RuleEngine(
     @Synchronized
     fun onCanEvent(event: FytEvent) {
         if (event.module != "CANBUS") return
+
+        // O(1): index không có rule bỏ ngay, không filter/list allocation.
+        val relevantRules = rulesByIndex[event.index] ?: return
         val values = event.ints ?: return
 
-        // CAN như 1019 có thể bắn liên tục. Nếu index đó không nằm trong bất kỳ rule đang bật nào,
-        // bỏ ngay mà không quét toàn bộ rule và không đụng AudioEngine.
-        val relevantRules = rules.filter { it.enabled && it.index == event.index }
-        if (relevantRules.isEmpty()) return
+        var matched = false
+        for (rule in relevantRules) {
+            val position = rule.position
+            if (position < 0 || position >= values.size) continue
 
-        val matched = relevantRules.any { rule ->
-            if (rule.position !in values.indices) return@any false
-            val actualRaw = values[rule.position]
+            val actualRaw = values[position]
             val actual = if (rule.unsignedByte) actualRaw and 0xFF else actualRaw
-            actual == rule.expectedValue
+            if (actual == rule.expectedValue) {
+                matched = true
+                break
+            }
         }
+
         if (!matched) {
-            // Không stop ngay: frame OFF của nhịp chớp có thể xen giữa hai frame ON.
-            // stopRunnable sẽ kết thúc âm thanh nếu không còn frame match mới trong holdMillis.
+            // Không false ngay ở frame OFF/non-match. CANBOX có thể phát ON/OFF xen kẽ theo nhịp đèn.
             return
         }
 
+        // Heartbeat cực nhẹ. Đây là việc duy nhất frame match lặp lại cần làm khi active=true.
         lastMatchElapsed = SystemClock.elapsedRealtime()
+
+        if (active) {
+            // Audio đang chạy rồi: không gọi AudioEngine, không thao tác Handler/timer theo frame.
+            return
+        }
+
         setActiveLocked(true)
-        handler.removeCallbacks(stopRunnable)
-        handler.postDelayed(stopRunnable, holdMillis)
+        scheduleWatchdogLocked(WATCHDOG_INTERVAL_MS)
     }
 
     @Synchronized
     fun clearState() {
-        handler.removeCallbacks(stopRunnable)
+        handler.removeCallbacks(watchdogRunnable)
+        watchdogScheduled = false
         lastMatchElapsed = 0L
         setActiveLocked(false)
     }
@@ -300,18 +332,30 @@ class RuleEngine(
     @Synchronized
     fun release() {
         clearState()
+        rulesSnapshot = emptyList()
+        rulesByIndex = emptyMap()
     }
 
     @Synchronized
-    private fun handleHoldTimeout() {
+    private fun handleWatchdog() {
+        watchdogScheduled = false
         if (!active) return
+
         val elapsed = SystemClock.elapsedRealtime() - lastMatchElapsed
         val remaining = holdMillis - elapsed
-        if (remaining > 0L) {
-            handler.postDelayed(stopRunnable, remaining)
+        if (remaining <= 0L) {
+            setActiveLocked(false)
             return
         }
-        setActiveLocked(false)
+
+        // Tần suất watchdog cố định, hoàn toàn độc lập với số lượng CAN frame nhận được.
+        scheduleWatchdogLocked(minOf(WATCHDOG_INTERVAL_MS, remaining).coerceAtLeast(1L))
+    }
+
+    private fun scheduleWatchdogLocked(delayMillis: Long) {
+        if (watchdogScheduled) return
+        watchdogScheduled = true
+        handler.postDelayed(watchdogRunnable, delayMillis)
     }
 
     private fun setActiveLocked(value: Boolean) {
@@ -321,9 +365,11 @@ class RuleEngine(
     }
 
     companion object {
-        // Lớn hơn một chu kỳ chớp CAN thông thường để nối các frame ON thành một phiên liên tục,
-        // nhưng vẫn đủ ngắn để tắt âm thanh sớm sau khi người lái tắt xi nhan.
+        // Nếu sau 1.3 giây không có frame nào MATCH nữa thì coi xi nhan đã tắt.
         private const val DEFAULT_HOLD_MS = 1300L
+
+        // Chỉ 10 lần kiểm tra/giây dù CANBUS có spam hàng trăm hoặc hàng nghìn frame/giây.
+        private const val WATCHDOG_INTERVAL_MS = 100L
     }
 }
 
