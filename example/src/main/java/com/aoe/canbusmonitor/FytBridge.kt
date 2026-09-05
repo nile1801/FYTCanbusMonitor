@@ -5,6 +5,39 @@ import com.aoe.fytcanbusmonitor.ConnectionObserver
 import com.aoe.fytcanbusmonitor.IModuleCallback
 import com.aoe.fytcanbusmonitor.IRemoteToolkit
 import com.aoe.fytcanbusmonitor.RemoteModuleProxy
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+
+private object MonitorDispatcher {
+    private val threadNumber = AtomicInteger(1)
+    private val executor = ThreadPoolExecutor(
+        1,
+        1,
+        0L,
+        TimeUnit.MILLISECONDS,
+        ArrayBlockingQueue(512),
+        ThreadFactory { runnable ->
+            Thread(runnable, "FYT-Monitor-${threadNumber.getAndIncrement()}").apply {
+                isDaemon = true
+                priority = Thread.NORM_PRIORITY - 1
+            }
+        },
+        ThreadPoolExecutor.DiscardOldestPolicy()
+    )
+
+    fun submit(event: FytEvent) {
+        executor.execute {
+            try {
+                MonitorStore.accept(event)
+            } catch (_: Throwable) {
+                // Monitor/log không được phép làm ảnh hưởng đường xử lý CAN -> âm thanh.
+            }
+        }
+    }
+}
 
 class FytModuleCallback(
     private val moduleName: String,
@@ -24,8 +57,14 @@ class FytModuleCallback(
             floats = floatArray?.copyOf(),
             strings = strArray?.copyOf()
         )
-        MonitorStore.accept(event)
+
+        // Đường ưu tiên: xử lý rule/audio ngay trên callback FYT.
+        // Không format chuỗi, ghi Logcat hay cập nhật monitor trước khi xét luật.
         onEvent(event)
+
+        // Đường phụ: monitor/log chạy ở worker riêng. Nếu CAN spam quá nhanh,
+        // hàng đợi có giới hạn và bỏ log cũ thay vì làm nghẽn callback CAN.
+        MonitorDispatcher.submit(event)
     }
 }
 
