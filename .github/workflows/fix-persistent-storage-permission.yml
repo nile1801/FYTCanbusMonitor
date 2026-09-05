@@ -24,20 +24,25 @@ jobs:
         run: |
           from pathlib import Path
 
+          def block(*items):
+              return "\n".join(items)
+
           manifest = Path('example/src/main/AndroidManifest.xml')
           text = manifest.read_text(encoding='utf-8')
-          permission = '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />\n'
           if 'android.permission.MANAGE_EXTERNAL_STORAGE' not in text:
               marker = '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
               if marker not in text:
                   raise SystemExit('Manifest permission marker not found')
+              permission = '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />\n'
               text = text.replace(marker, marker + permission, 1)
               manifest.write_text(text, encoding='utf-8')
 
           gradle = Path('example/build.gradle')
           text = gradle.read_text(encoding='utf-8')
-          text = text.replace('versionCode 10', 'versionCode 11', 1)
-          text = text.replace('versionName "1.6.0-persistent-rules-multi-filter"', 'versionName "1.6.1-persistent-storage-permission"', 1)
+          if 'versionCode 10' in text:
+              text = text.replace('versionCode 10', 'versionCode 11', 1)
+          if 'versionName "1.6.0-persistent-rules-multi-filter"' in text:
+              text = text.replace('versionName "1.6.0-persistent-rules-multi-filter"', 'versionName "1.6.1-persistent-storage-permission"', 1)
           gradle.write_text(text, encoding='utf-8')
 
           main = Path('example/src/main/java/com/aoe/canbusmonitor/MainActivity.kt')
@@ -60,11 +65,7 @@ jobs:
               marker = '    private var selectedTabIndex = 0\n'
               if marker not in text:
                   raise SystemExit('selectedTabIndex marker not found')
-              text = text.replace(
-                  marker,
-                  marker + '    private var storagePermissionDialogShown = false\n    private var storageAccessWasGranted = false\n',
-                  1
-              )
+              text = text.replace(marker, marker + '    private var storagePermissionDialogShown = false\n    private var storageAccessWasGranted = false\n', 1)
 
           if 'storageAccessWasGranted = hasPersistentStorageAccess()' not in text:
               marker = '        super.onCreate(savedInstanceState)\n\n'
@@ -73,114 +74,124 @@ jobs:
               text = text.replace(marker, marker + '        storageAccessWasGranted = hasPersistentStorageAccess()\n\n', 1)
 
           old_handler = '        handler.post { requestNotificationPermissionIfNeeded() }'
-          new_handler = '''        handler.post {
-            if (!requestPersistentStoragePermissionIfNeeded()) {
-                requestNotificationPermissionIfNeeded()
-            }
-        }'''
+          new_handler = block(
+              '        handler.post {',
+              '            if (!requestPersistentStoragePermissionIfNeeded()) {',
+              '                requestNotificationPermissionIfNeeded()',
+              '            }',
+              '        }'
+          )
           if old_handler in text:
               text = text.replace(old_handler, new_handler, 1)
 
-          resume_marker = '''    override fun onResume() {
-        super.onResume()
-        MonitorCaptureState.enabled = selectedTabIndex == 0 && !monitorPaused'''
-          resume_replacement = '''    override fun onResume() {
-        super.onResume()
-
-        val hasStorageAccess = hasPersistentStorageAccess()
-        if (hasStorageAccess && !storageAccessWasGranted) {
-            val restoredRules = RuleStore.load(this)
-            renderRules()
-            sendServiceAction(TurnSignalService.ACTION_REFRESH)
-            if (restoredRules.isNotEmpty()) {
-                toast("Đã đọc lại ${restoredRules.size} rule sau khi cấp quyền backup")
-            }
-        }
-        storageAccessWasGranted = hasStorageAccess
-        refreshStorageAccessStatus()
-        if (storagePermissionDialogShown) requestNotificationPermissionIfNeeded()
-
-        MonitorCaptureState.enabled = selectedTabIndex == 0 && !monitorPaused'''
+          resume_marker = block(
+              '    override fun onResume() {',
+              '        super.onResume()',
+              '        MonitorCaptureState.enabled = selectedTabIndex == 0 && !monitorPaused'
+          )
+          resume_replacement = block(
+              '    override fun onResume() {',
+              '        super.onResume()',
+              '',
+              '        val hasStorageAccess = hasPersistentStorageAccess()',
+              '        if (hasStorageAccess && !storageAccessWasGranted) {',
+              '            val restoredRules = RuleStore.load(this)',
+              '            renderRules()',
+              '            sendServiceAction(TurnSignalService.ACTION_REFRESH)',
+              '            if (restoredRules.isNotEmpty()) {',
+              '                toast("Đã đọc lại ${restoredRules.size} rule sau khi cấp quyền backup")',
+              '            }',
+              '        }',
+              '        storageAccessWasGranted = hasStorageAccess',
+              '        refreshStorageAccessStatus()',
+              '        if (storagePermissionDialogShown) requestNotificationPermissionIfNeeded()',
+              '',
+              '        MonitorCaptureState.enabled = selectedTabIndex == 0 && !monitorPaused'
+          )
           if resume_marker in text and 'val hasStorageAccess = hasPersistentStorageAccess()' not in text:
               text = text.replace(resume_marker, resume_replacement, 1)
 
-          old_backup = '''        root.addView(TextView(this).apply {
-            text = "Backup rule tự động: ${RuleBackupStore.DISPLAY_PATH}. File nằm ngoài vùng dữ liệu riêng của app; khi cài lại app sẽ thử tìm và restore từng rule đọc được."
-            setPadding(0, 0, 0, dp(10))
-        })'''
-          new_backup = '''        storageAccessStatusText = TextView(this).apply {
-            setPadding(0, 0, 0, dp(6))
-        }
-        root.addView(storageAccessStatusText)
-        root.addView(Button(this).apply {
-            text = "CẤP / KIỂM TRA QUYỀN BACKUP FILE"
-            setOnClickListener { openAllFilesAccessSettings() }
-        })
-        root.addView(TextView(this).apply {
-            text = "Backup rule: ${RuleBackupStore.DISPLAY_PATH}. Muốn tự restore sau khi uninstall/cài lại, Android 11+ cần bật quyền Quản lý tất cả tệp cho app."
-            setPadding(0, dp(4), 0, dp(10))
-        })
-        refreshStorageAccessStatus()'''
+          old_backup = block(
+              '        root.addView(TextView(this).apply {',
+              '            text = "Backup rule tự động: ${RuleBackupStore.DISPLAY_PATH}. File nằm ngoài vùng dữ liệu riêng của app; khi cài lại app sẽ thử tìm và restore từng rule đọc được."',
+              '            setPadding(0, 0, 0, dp(10))',
+              '        })'
+          )
+          new_backup = block(
+              '        storageAccessStatusText = TextView(this).apply {',
+              '            setPadding(0, 0, 0, dp(6))',
+              '        }',
+              '        root.addView(storageAccessStatusText)',
+              '        root.addView(Button(this).apply {',
+              '            text = "CẤP / KIỂM TRA QUYỀN BACKUP FILE"',
+              '            setOnClickListener { openAllFilesAccessSettings() }',
+              '        })',
+              '        root.addView(TextView(this).apply {',
+              '            text = "Backup rule: ${RuleBackupStore.DISPLAY_PATH}. Muốn tự restore sau khi uninstall/cài lại, Android 11+ cần bật quyền Quản lý tất cả tệp cho app."',
+              '            setPadding(0, dp(4), 0, dp(10))',
+              '        })',
+              '        refreshStorageAccessStatus()'
+          )
           if old_backup in text:
               text = text.replace(old_backup, new_backup, 1)
 
-          permission_methods = '''
-    private fun hasPersistentStorageAccess(): Boolean {
-        return Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
-    }
-
-    /**
-     * Android 11+ dùng special app access, không có runtime Allow/Deny dialog kiểu permission thường.
-     * Lần cài mới sẽ giải thích rồi đưa user tới đúng trang bật "Allow access to manage all files".
-     */
-    private fun requestPersistentStoragePermissionIfNeeded(): Boolean {
-        if (hasPersistentStorageAccess() || storagePermissionDialogShown) return false
-        storagePermissionDialogShown = true
-        AlertDialog.Builder(this)
-            .setTitle("Cấp quyền lưu/restore rule")
-            .setMessage(
-                "Để rules.json vẫn đọc được sau khi uninstall rồi cài lại, app cần quyền Quản lý tất cả tệp. " +
-                    "Android sẽ mở trang Special app access; hãy bật Allow access to manage all files cho FYT Turn Sound."
-            )
-            .setNegativeButton("ĐỂ SAU") { _, _ -> requestNotificationPermissionIfNeeded() }
-            .setPositiveButton("CẤP QUYỀN") { _, _ -> openAllFilesAccessSettings() }
-            .show()
-        return true
-    }
-
-    private fun openAllFilesAccessSettings() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
-        val packageUri = Uri.parse("package:$packageName")
-        val intents = arrayOf(
-            Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, packageUri),
-            Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
-            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri)
-        )
-        for (intent in intents) {
-            try {
-                startActivity(intent)
-                return
-            } catch (_: Throwable) {
-            }
-        }
-        toast("Không mở được màn cấp quyền lưu trữ trên ROM này")
-    }
-
-    private fun refreshStorageAccessStatus() {
-        if (!::storageAccessStatusText.isInitialized) return
-        storageAccessStatusText.text = if (hasPersistentStorageAccess()) {
-            "Quyền backup file: ĐÃ CẤP • có thể đọc/ghi trực tiếp ${RuleBackupStore.DISPLAY_PATH}"
-        } else {
-            "Quyền backup file: CHƯA CẤP • rule vẫn lưu trong app nhưng có thể không restore sau uninstall"
-        }
-    }
-
-'''
+          permission_methods = block(
+              '    private fun hasPersistentStorageAccess(): Boolean {',
+              '        return Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()',
+              '    }',
+              '',
+              '    /**',
+              '     * Android 11+ dùng special app access, không có runtime Allow/Deny dialog kiểu permission thường.',
+              '     * Lần cài mới sẽ giải thích rồi đưa user tới đúng trang bật Allow access to manage all files.',
+              '     */',
+              '    private fun requestPersistentStoragePermissionIfNeeded(): Boolean {',
+              '        if (hasPersistentStorageAccess() || storagePermissionDialogShown) return false',
+              '        storagePermissionDialogShown = true',
+              '        AlertDialog.Builder(this)',
+              '            .setTitle("Cấp quyền lưu/restore rule")',
+              '            .setMessage(',
+              '                "Để rules.json vẫn đọc được sau khi uninstall rồi cài lại, app cần quyền Quản lý tất cả tệp. " +',
+              '                    "Android sẽ mở trang Special app access; hãy bật Allow access to manage all files cho FYT Turn Sound."',
+              '            )',
+              '            .setNegativeButton("ĐỂ SAU") { _, _ -> requestNotificationPermissionIfNeeded() }',
+              '            .setPositiveButton("CẤP QUYỀN") { _, _ -> openAllFilesAccessSettings() }',
+              '            .show()',
+              '        return true',
+              '    }',
+              '',
+              '    private fun openAllFilesAccessSettings() {',
+              '        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return',
+              '        val packageUri = Uri.parse("package:$packageName")',
+              '        val intents = arrayOf(',
+              '            Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, packageUri),',
+              '            Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),',
+              '            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri)',
+              '        )',
+              '        for (intent in intents) {',
+              '            try {',
+              '                startActivity(intent)',
+              '                return',
+              '            } catch (_: Throwable) {',
+              '            }',
+              '        }',
+              '        toast("Không mở được màn cấp quyền lưu trữ trên ROM này")',
+              '    }',
+              '',
+              '    private fun refreshStorageAccessStatus() {',
+              '        if (!::storageAccessStatusText.isInitialized) return',
+              '        storageAccessStatusText.text = if (hasPersistentStorageAccess()) {',
+              '            "Quyền backup file: ĐÃ CẤP • có thể đọc/ghi trực tiếp ${RuleBackupStore.DISPLAY_PATH}"',
+              '        } else {',
+              '            "Quyền backup file: CHƯA CẤP • rule vẫn lưu trong app nhưng có thể không restore sau uninstall"',
+              '        }',
+              '    }',
+              ''
+          )
           method_marker = '    private fun requestNotificationPermissionIfNeeded() {'
           if 'private fun hasPersistentStorageAccess()' not in text:
               if method_marker not in text:
                   raise SystemExit('notification permission method marker not found')
-              text = text.replace(method_marker, permission_methods + method_marker, 1)
+              text = text.replace(method_marker, permission_methods + '\n' + method_marker, 1)
 
           main.write_text(text, encoding='utf-8')
 
