@@ -11,10 +11,7 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
-/**
- * Monitor là công cụ debug, không cần chạy khi app ở background hoặc đang ở tab khác.
- * Tắt capture giúp callback CAN non-rule return trước khi copy array/tạo FytEvent.
- */
+/** Monitor chỉ chạy khi tab Giám sát đang mở và không pause. */
 object MonitorCaptureState {
     @Volatile var enabled: Boolean = false
 }
@@ -41,7 +38,7 @@ private object MonitorDispatcher {
             try {
                 MonitorStore.accept(event)
             } catch (_: Throwable) {
-                // Monitor/log không được phép làm ảnh hưởng đường xử lý CAN -> âm thanh.
+                // Monitor/log tuyệt đối không được ảnh hưởng đường rule -> audio.
             }
         }
     }
@@ -49,7 +46,7 @@ private object MonitorDispatcher {
 
 class FytModuleCallback(
     private val moduleName: String,
-    private val onEvent: (FytEvent) -> Unit,
+    private val onRuleEvent: (module: String, index: Int, ints: IntArray?) -> Unit,
     private val shouldDeliverToRule: ((Int) -> Boolean)? = null
 ) : IModuleCallback.Stub() {
     @Throws(RemoteException::class)
@@ -59,18 +56,22 @@ class FytModuleCallback(
         floatArray: FloatArray?,
         strArray: Array<String?>?
     ) {
-        // Kiểm tra thật sớm trước khi copy array/tạo FytEvent. Với CANBUS, RuleEngine truyền
-        // predicate O(1) dựa trên index; index không có rule sẽ không đi vào đường audio.
+        // O(1) lookup trước mọi allocation.
         val deliverToRule = shouldDeliverToRule?.invoke(updateCode) ?: true
-
-        // Monitor chỉ capture khi tab Giám sát đang thực sự mở và không pause.
-        // Filter cũng được xét trước queue, ví dụ exclude 1019 thì 1019 bị bỏ tại đây.
         val deliverToMonitor = MonitorCaptureState.enabled &&
             MonitorStore.shouldQueueFast(moduleName, updateCode)
 
-        // Fastest path: background + index không có rule => return ngay, không allocation.
         if (!deliverToRule && !deliverToMonitor) return
 
+        // Đường ưu tiên: đọc IntArray AIDL trực tiếp ngay trong callback, không copy, không tạo FytEvent.
+        // RuleEngine không giữ reference sau khi hàm này return.
+        if (deliverToRule) {
+            onRuleEvent(moduleName, updateCode, intArray)
+        }
+
+        if (!deliverToMonitor) return
+
+        // Chỉ debug monitor mới cần snapshot/copy để xử lý bất đồng bộ ở worker riêng.
         val event = FytEvent(
             module = moduleName,
             index = updateCode,
@@ -78,12 +79,7 @@ class FytModuleCallback(
             floats = floatArray?.copyOf(),
             strings = strArray?.copyOf()
         )
-
-        // Đường ưu tiên: chỉ index được RuleEngine quan tâm mới vào đây.
-        if (deliverToRule) onEvent(event)
-
-        // Đường phụ: queue monitor riêng, giới hạn để không bao giờ làm nghẽn đường audio.
-        if (deliverToMonitor) MonitorDispatcher.submit(event)
+        MonitorDispatcher.submit(event)
     }
 }
 
