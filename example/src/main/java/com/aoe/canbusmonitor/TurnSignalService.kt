@@ -24,14 +24,12 @@ class TurnSignalService : Service() {
     private val statusObserver = object : ConnectionObserver {
         override fun onConnected(toolkit: IRemoteToolkit?) {
             RuntimeState.fytConnected = toolkit != null
-            // Không xóa lỗi AudioEngine nếu audio vẫn chưa READY.
             if (RuntimeState.audioReady) RuntimeState.lastError = null
             updateNotification()
         }
 
         override fun onDisconnected() {
             RuntimeState.fytConnected = false
-            RuntimeState.ruleActive = false
             if (!destroying) {
                 ruleEngine.clearState()
                 audio.stopRule()
@@ -47,51 +45,56 @@ class TurnSignalService : Service() {
 
         MonitorStore.configureFilter(
             SettingsStore.monitorFilterMode(this),
+            SettingsStore.monitorFilterModule(this),
             SettingsStore.monitorFilterIndex(this)
         )
 
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
 
-        // Decode MP3 một lần thành PCM trong RAM và khởi tạo AudioTrack ngay khi service chạy.
+        // Decode MP3 đúng một lần thành PCM trong RAM.
         audio = AudioEngine(this)
-        ruleEngine = RuleEngine { active ->
-            RuntimeState.ruleActive = active
-            val shouldPlay = active && SettingsStore.isEnabled(this)
-            audio.setRuleActive(shouldPlay)
+
+        // State tách riêng TRÁI / PHẢI / HAZARD. Audio chỉ cần biết có ít nhất một nhóm đang active.
+        ruleEngine = RuleEngine { state ->
+            RuntimeState.leftActive = state.left
+            RuntimeState.rightActive = state.right
+            RuntimeState.hazardActive = state.hazard
+            RuntimeState.ruleActive = state.anyActive
+            audio.setRuleActive(state.anyActive && SettingsStore.isEnabled(this))
             updateNotification()
         }
+        ruleEngine.setStopMode(SettingsStore.stopMode(this))
         ruleEngine.setRules(RuleStore.load(this))
 
         if (RuntimeState.fytPackagePresent) {
             connectToFyt()
         } else {
-            // Chế độ thử trên điện thoại/tablet Android thường: UI và audio vẫn chạy.
             RuntimeState.fytConnected = false
-            // Trước đây dòng này luôn xóa lastError và che mất lỗi decode/AudioTrack.
             if (RuntimeState.audioReady) RuntimeState.lastError = null
             updateNotification()
         }
     }
 
     private fun connectToFyt() {
-        // MAIN/BT chỉ phục vụ monitor; không có đường rule/audio.
+        // MAIN giờ có thể dùng làm rule, ví dụ hazard của xe chỉ phát event ở module MAIN.
         val mainCallback = FytModuleCallback(
-            moduleName = "MAIN",
-            onEvent = { },
-            shouldDeliverToRule = { false }
+            moduleName = RuleModule.MAIN.name,
+            onEvent = { event -> ruleEngine.onFytEvent(event) },
+            shouldDeliverToRule = { index -> ruleEngine.hasRuleFor(RuleModule.MAIN.name, index) }
         )
+
+        // BT vẫn chỉ dùng monitor/debug.
         val btCallback = FytModuleCallback(
             moduleName = "BT",
             onEvent = { },
             shouldDeliverToRule = { false }
         )
 
-        // CANBUS lookup rule index O(1) ngay ở Binder callback, trước khi copy array/tạo FytEvent.
         val canCallback = FytModuleCallback(
-            moduleName = "CANBUS",
-            onEvent = { event -> ruleEngine.onCanEvent(event) },
-            shouldDeliverToRule = { index -> ruleEngine.hasRuleForIndex(index) }
+            moduleName = RuleModule.CANBUS.name,
+            onEvent = { event -> ruleEngine.onFytEvent(event) },
+            shouldDeliverToRule = { index -> ruleEngine.hasRuleFor(RuleModule.CANBUS.name, index) }
         )
 
         observers += statusObserver
@@ -115,7 +118,6 @@ class TurnSignalService : Service() {
         try {
             MsToolkitConnection.instance.connect(applicationContext)
         } catch (t: Throwable) {
-            // Nếu audio đang lỗi thì giữ lỗi audio vì nó liên quan trực tiếp nút thử/xi nhan.
             if (RuntimeState.audioReady) {
                 RuntimeState.lastError = "Kết nối FYT: ${t.javaClass.simpleName}: ${t.message}"
             }
@@ -144,6 +146,7 @@ class TurnSignalService : Service() {
             ACTION_STOP_TEST -> audio.stopTest()
             ACTION_STOP_SERVICE -> {
                 audio.stopTest()
+                ruleEngine.clearState()
                 audio.stopRule()
                 stopSelf()
             }
@@ -155,10 +158,13 @@ class TurnSignalService : Service() {
     private fun refreshConfiguration() {
         MonitorStore.configureFilter(
             SettingsStore.monitorFilterMode(this),
+            SettingsStore.monitorFilterModule(this),
             SettingsStore.monitorFilterIndex(this)
         )
+        ruleEngine.setStopMode(SettingsStore.stopMode(this))
         ruleEngine.setRules(RuleStore.load(this))
         audio.setVolume(SettingsStore.volume(this))
+
         if (SettingsStore.isEnabled(this) && ruleEngine.active) {
             audio.setRuleActive(true)
         } else {
@@ -176,6 +182,9 @@ class TurnSignalService : Service() {
         RuntimeState.serviceRunning = false
         RuntimeState.fytConnected = false
         RuntimeState.ruleActive = false
+        RuntimeState.leftActive = false
+        RuntimeState.rightActive = false
+        RuntimeState.hazardActive = false
         super.onDestroy()
     }
 
@@ -188,7 +197,7 @@ class TurnSignalService : Service() {
             getString(R.string.notification_channel_name),
             NotificationManager.IMPORTANCE_LOW
         ).apply {
-            description = "Giữ dịch vụ giám sát FYT CAN chạy nền"
+            description = "Giữ dịch vụ giám sát FYT chạy nền"
             setSound(null, null)
             enableVibration(false)
         }
@@ -206,9 +215,9 @@ class TurnSignalService : Service() {
         val status = when {
             !RuntimeState.audioReady -> "Audio chưa sẵn sàng"
             !RuntimeState.fytPackagePresent -> "Chế độ thử điện thoại • audio đã sẵn sàng"
-            !RuntimeState.fytConnected -> "Đang chờ dịch vụ FYT CAN"
-            RuntimeState.ruleActive && SettingsStore.isEnabled(this) -> "Đã kết nối CAN • âm xi nhan đang phát"
-            else -> "Đã kết nối CAN • đang giám sát"
+            !RuntimeState.fytConnected -> "Đang chờ dịch vụ FYT"
+            RuntimeState.ruleActive && SettingsStore.isEnabled(this) -> "FYT rule đang active • âm xi nhan đang phát"
+            else -> "Đã kết nối FYT • đang giám sát rule"
         }
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_more)
