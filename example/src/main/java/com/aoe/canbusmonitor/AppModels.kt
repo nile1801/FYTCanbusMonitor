@@ -13,7 +13,7 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
-/** Bản sao có cấu trúc của từng payload callback FYT. */
+/** Bản sao có cấu trúc chỉ dùng cho monitor/debug. */
 data class FytEvent(
     val module: String,
     val index: Int,
@@ -46,10 +46,6 @@ enum class MonitorFilterMode {
     EXCLUDE_CAN_INDEX
 }
 
-/**
- * Monitor/debug chạy tách khỏi đường rule/audio.
- * Filter được kiểm tra ngay tại Binder callback trước khi copy array/tạo FytEvent.
- */
 object MonitorStore {
     private const val MAX_LINES = 2500
     private val lines = ArrayDeque<String>()
@@ -98,7 +94,6 @@ object MonitorStore {
 
     @Synchronized
     fun accept(event: FytEvent): Boolean {
-        // Re-check vì filter có thể đổi sau khi event đã vào queue.
         if (!shouldQueueFast(event.module, event.index)) return false
 
         val payload = event.formattedPayload()
@@ -327,12 +322,13 @@ data class RuleStateSnapshot(
 /**
  * RuleEngine fast-path cho CANBUS/MAIN có tần suất cao.
  *
- * - Rule được index sẵn theo module + index để lookup O(1).
- * - TIMEOUT: chỉ START rule được đưa vào fast-path. Mỗi target tự timeout sau 1.5 giây kể từ
- *   START match cuối cùng; watchdog 100 ms độc lập với tần suất event.
- * - TRIGGER: START target giữ true cho tới khi STOP rule của đúng target match. Không có timeout.
- * - Khi target đã true, START match tiếp theo không gọi AudioEngine; TIMEOUT chỉ cập nhật heartbeat,
- *   TRIGGER bỏ qua hoàn toàn.
+ * Hot-path background không tạo FytEvent và không copy IntArray: đọc trực tiếp IntArray AIDL
+ * đồng bộ ngay trong callback rồi trả về.
+ *
+ * - Rule index sẵn theo module + index để lookup O(1).
+ * - TIMEOUT: chỉ START rule được đăng ký vào fast-path; target false sau 1.5 giây không có START match.
+ * - TRIGGER: target giữ true cho tới STOP rule đúng target. Không có timeout.
+ * - Target đã true: START lặp lại chỉ refresh heartbeat ở TIMEOUT; TRIGGER bỏ qua.
  */
 class RuleEngine(
     private val holdMillis: Long = DEFAULT_HOLD_MS,
@@ -354,7 +350,7 @@ class RuleEngine(
     @Volatile var active: Boolean = false
         private set
 
-    /** Binder fast-path: O(1), không tạo object. */
+    /** Binder fast-path: O(1), không allocation. */
     fun hasRuleFor(module: String, index: Int): Boolean {
         return when (module) {
             RuleModule.CANBUS.name -> canRulesByIndex[index] != null
@@ -394,25 +390,28 @@ class RuleEngine(
         mainRulesByIndex = main.mapValues { (_, list) -> list.toTypedArray() }
     }
 
+    /**
+     * Được gọi đồng bộ ngay trong IModuleCallback.update(). Không giữ reference tới values sau khi return.
+     */
     @Synchronized
-    fun onFytEvent(event: FytEvent) {
-        val relevantRules = when (event.module) {
-            RuleModule.CANBUS.name -> canRulesByIndex[event.index]
-            RuleModule.MAIN.name -> mainRulesByIndex[event.index]
+    fun onRawEvent(module: String, index: Int, values: IntArray?) {
+        val relevantRules = when (module) {
+            RuleModule.CANBUS.name -> canRulesByIndex[index]
+            RuleModule.MAIN.name -> mainRulesByIndex[index]
             else -> null
         } ?: return
+        values ?: return
 
-        val values = event.ints ?: return
-        val stoppedThisEvent = BooleanArray(SignalTarget.values().size)
+        var stoppedMask = 0
         var stateChanged = false
         val now = SystemClock.elapsedRealtime()
 
-        // Ở TRIGGER mode, STOP được xử lý trước và có ưu tiên hơn START nếu cùng event cùng target.
+        // Trigger TẮT ưu tiên nếu cùng một event vô tình match cả START và STOP của cùng target.
         if (stopMode == StopMode.TRIGGER) {
             for (rule in relevantRules) {
                 if (rule.action != RuleAction.STOP || !matches(rule, values)) continue
                 val ordinal = rule.target.ordinal
-                stoppedThisEvent[ordinal] = true
+                stoppedMask = stoppedMask or (1 shl ordinal)
                 if (targetActive[ordinal]) {
                     targetActive[ordinal] = false
                     lastMatchElapsed[ordinal] = 0L
@@ -425,11 +424,10 @@ class RuleEngine(
         for (rule in relevantRules) {
             if (rule.action != RuleAction.START || !matches(rule, values)) continue
             val ordinal = rule.target.ordinal
-            if (stoppedThisEvent[ordinal]) continue
+            if ((stoppedMask and (1 shl ordinal)) != 0) continue
 
             if (targetActive[ordinal]) {
                 if (stopMode == StopMode.TIMEOUT) {
-                    // Target đang true: chỉ refresh heartbeat, không gọi AudioEngine/Handler theo frame.
                     lastMatchElapsed[ordinal] = now
                 }
                 continue
@@ -442,7 +440,6 @@ class RuleEngine(
         }
 
         if (stateChanged) emitStateLocked()
-
         if (stopMode == StopMode.TIMEOUT && activeCount > 0) {
             scheduleWatchdogLocked(WATCHDOG_INTERVAL_MS)
         }
@@ -464,7 +461,7 @@ class RuleEngine(
     private fun clearStateLocked() {
         handler.removeCallbacks(watchdogRunnable)
         watchdogScheduled = false
-        var changed = activeCount > 0
+        val changed = activeCount > 0
         activeCount = 0
         for (i in targetActive.indices) {
             targetActive[i] = false
