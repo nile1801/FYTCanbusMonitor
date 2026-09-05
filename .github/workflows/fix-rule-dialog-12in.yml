@@ -28,15 +28,23 @@ jobs:
           path = Path('example/src/main/java/com/aoe/canbusmonitor/MainActivity.kt')
           text = path.read_text(encoding='utf-8')
 
-          old = '''        val dialog = AlertDialog.Builder(this)
-              .setTitle(if (existing == null) "Thêm trigger FYT" else "Sửa trigger FYT")
-              .setView(root)
-              .setNegativeButton("HỦY", null)
-              .setPositiveButton("LƯU", null)
-              .create()
-          '''
+          title_line = '            .setTitle(if (existing == null) "Thêm trigger FYT" else "Sửa trigger FYT")'
+          already_line = '            .setView(scroll)'
+          title_pos = text.find(title_line)
+          if title_pos < 0:
+              raise SystemExit('Rule dialog title not found')
 
-          new = '''        val scroll = ScrollView(this).apply {
+          if already_line in text[title_pos:title_pos + 300]:
+              print('Patch already present')
+          else:
+              start = text.rfind('        val dialog = AlertDialog.Builder(this)', 0, title_pos)
+              end_marker = '            .create()'
+              end = text.find(end_marker, title_pos)
+              if start < 0 or end < 0:
+                  raise SystemExit('Rule dialog block boundaries not found')
+              end += len(end_marker)
+
+              replacement = '''        val scroll = ScrollView(this).apply {
               isFillViewport = true
               overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
           }
@@ -53,16 +61,10 @@ jobs:
               .setView(scroll)
               .setNegativeButton("HỦY", null)
               .setPositiveButton("LƯU", null)
-              .create()
-          '''
+              .create()'''
 
-          if old not in text:
-              if '.setTitle(if (existing == null) "Thêm trigger FYT" else "Sửa trigger FYT")\n            .setView(scroll)' in text:
-                  print('Patch already present')
-              else:
-                  raise SystemExit('Target dialog block not found; refusing to patch the wrong dialog')
-          else:
-              path.write_text(text.replace(old, new, 1), encoding='utf-8')
+              text = text[:start] + replacement + text[end:]
+              path.write_text(text, encoding='utf-8')
               print('Patched MainActivity.kt')
 
       - name: Commit source fix back to main
