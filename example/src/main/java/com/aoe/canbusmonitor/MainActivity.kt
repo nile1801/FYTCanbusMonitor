@@ -14,13 +14,17 @@ import android.os.Looper
 import android.provider.MediaStore
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.SeekBar
+import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
@@ -28,7 +32,7 @@ import android.widget.Toast
 class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var monitorText: TextView
-    private lateinit var latestCanText: TextView
+    private lateinit var latestEventText: TextView
     private lateinit var filterStatusText: TextView
     private lateinit var rulesContainer: LinearLayout
     private lateinit var serviceStatusText: TextView
@@ -51,23 +55,20 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Nạp filter trước khi dựng tab monitor để trạng thái hiển thị đúng ngay khi mở app.
         MonitorStore.configureFilter(
             SettingsStore.monitorFilterMode(this),
+            SettingsStore.monitorFilterModule(this),
             SettingsStore.monitorFilterIndex(this)
         )
 
-        // Dựng giao diện trước khi khởi động service hoặc hiện hộp thoại quyền thông báo.
         setContentView(buildTabbedUi())
         renderRules()
         startTurnService()
-
         handler.post { requestNotificationPermissionIfNeeded() }
     }
 
     override fun onResume() {
         super.onResume()
-        // Chỉ capture toàn bộ monitor khi đúng tab Giám sát đang mở và không pause.
         MonitorCaptureState.enabled = selectedTabIndex == 0 && !monitorPaused
         handler.removeCallbacks(refresher)
         handler.post(refresher)
@@ -75,18 +76,13 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
-        // App chạy nền: non-rule CAN bị bỏ ngay tại Binder callback trước khi copy array.
         MonitorCaptureState.enabled = false
         handler.removeCallbacks(refresher)
         super.onPause()
     }
 
-    /** Thanh tab nhẹ dùng Button + FrameLayout để tránh phụ thuộc vào TabHost cũ. */
     private fun buildTabbedUi(): View {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val tabBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(4), dp(4), dp(4), dp(4))
@@ -116,7 +112,6 @@ class MainActivity : Activity() {
                 setOnClickListener {
                     selectedTabIndex = pageIndex
                     MonitorCaptureState.enabled = pageIndex == 0 && !monitorPaused
-
                     pages.forEachIndexed { index, page ->
                         page.visibility = if (index == pageIndex) View.VISIBLE else View.GONE
                     }
@@ -135,35 +130,19 @@ class MainActivity : Activity() {
         }
 
         addTabButton("Giám sát", 0)
-        addTabButton("Luật CAN", 1)
+        addTabButton("Luật CAN / MAIN", 1)
         addTabButton("Âm thanh & dịch vụ", 2)
 
-        root.addView(
-            tabBar,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        )
-        root.addView(
-            content,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            )
-        )
+        root.addView(tabBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(content, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
-        pages.forEachIndexed { index, page ->
-            page.visibility = if (index == 0) View.VISIBLE else View.GONE
-        }
+        pages.forEachIndexed { index, page -> page.visibility = if (index == 0) View.VISIBLE else View.GONE }
         buttons.forEachIndexed { index, button -> button.isEnabled = index != 0 }
         selectedTabIndex = 0
         MonitorCaptureState.enabled = !monitorPaused
         return root
     }
 
-    /** Tab đầu tiên vẫn giữ kiểu monitor cuộn đơn giản của app FYTCanbusMonitor gốc. */
     private fun buildMonitorTab(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -204,24 +183,23 @@ class MainActivity : Activity() {
         }
         root.addView(filterStatusText)
 
-        latestCanText = TextView(this).apply {
-            text = "CANBUS mới nhất: đang chờ..."
+        latestEventText = TextView(this).apply {
+            text = "CANBUS/MAIN mới nhất: đang chờ..."
             setPadding(0, dp(6), 0, dp(4))
         }
-        root.addView(latestCanText)
+        root.addView(latestEventText)
 
-        val useLatest = Button(this).apply {
-            text = "DÙNG SỰ KIỆN CAN MỚI NHẤT LÀM LUẬT"
+        root.addView(Button(this).apply {
+            text = "DÙNG SỰ KIỆN CANBUS/MAIN MỚI NHẤT LÀM TRIGGER"
             setOnClickListener {
-                val event = MonitorStore.latestCanEvent
+                val event = MonitorStore.latestRuleEvent
                 if (event?.ints?.isEmpty() != false) {
-                    toast("Chưa có sự kiện CANBUS IntArray để dùng")
+                    toast("Chưa có sự kiện CANBUS/MAIN IntArray để dùng")
                 } else {
-                    showRuleDialog(null, event)
+                    showRuleDialog(null, event, RuleAction.START)
                 }
             }
-        }
-        root.addView(useLatest)
+        })
 
         monitorScroll = ScrollView(this)
         monitorText = TextView(this).apply {
@@ -229,23 +207,10 @@ class MainActivity : Activity() {
             textSize = 13f
             setTextIsSelectable(true)
             setPadding(dp(4), dp(6), dp(4), dp(12))
-            text = "Đang chờ dữ liệu FYT CAN..."
+            text = "Đang chờ dữ liệu FYT..."
         }
-        monitorScroll.addView(
-            monitorText,
-            ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        )
-        root.addView(
-            monitorScroll,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            )
-        )
+        monitorScroll.addView(monitorText, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(monitorScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         return root
     }
 
@@ -255,15 +220,54 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(10), dp(12), dp(16))
         }
+
         root.addView(TextView(this).apply {
-            text = "Chỉ cần một luật đang bật khớp dữ liệu CAN là phát âm thanh. Frame match đầu tiên phát ngay; các frame match tiếp theo chỉ cập nhật heartbeat, không khởi động lại âm thanh. Nếu quá khoảng 1,3 giây không còn frame match nào thì trạng thái mới chuyển về OFF. Hazard vẫn hoạt động nếu bất kỳ luật trái/phải hoặc luật hazard riêng khớp."
+            text = "Mỗi trigger có Nguồn (CANBUS/MAIN), Hành động (BẬT/TẮT) và Nhóm (TRÁI/PHẢI/HAZARD). Các nhóm có state riêng. Rule cũ được giữ lại và mặc định đọc là CANBUS + BẬT + TRÁI; hãy sửa mapping nếu cần."
             textSize = 15f
-            setPadding(0, 0, 0, dp(10))
+            setPadding(0, 0, 0, dp(8))
         })
-        root.addView(Button(this).apply {
-            text = "+ THÊM LUẬT"
-            setOnClickListener { showRuleDialog(null, null) }
+
+        root.addView(TextView(this).apply {
+            text = "CÁCH TẮT ÂM THANH"
+            textSize = 16f
+            setPadding(0, dp(4), 0, dp(4))
         })
+
+        val stopModeGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
+        val timeoutId = View.generateViewId()
+        val triggerId = View.generateViewId()
+        stopModeGroup.addView(RadioButton(this).apply {
+            id = timeoutId
+            text = "Tắt sau 1,5 giây không còn trigger BẬT match"
+        })
+        stopModeGroup.addView(RadioButton(this).apply {
+            id = triggerId
+            text = "Chỉ tắt khi trigger TẮT của đúng nhóm match"
+        })
+        stopModeGroup.check(if (SettingsStore.stopMode(this) == StopMode.TRIGGER) triggerId else timeoutId)
+        stopModeGroup.setOnCheckedChangeListener { _, checkedId ->
+            val mode = if (checkedId == triggerId) StopMode.TRIGGER else StopMode.TIMEOUT
+            SettingsStore.setStopMode(this, mode)
+            sendServiceAction(TurnSignalService.ACTION_REFRESH)
+        }
+        root.addView(stopModeGroup)
+
+        root.addView(TextView(this).apply {
+            text = "Ở chế độ trigger TẮT, app không tự timeout. Ví dụ TRÁI đã BẬT thì chỉ trigger TẮT map vào TRÁI mới tắt. PHẢI/HAZARD không tắt chéo nhau."
+            setPadding(0, dp(4), 0, dp(10))
+        })
+
+        val addRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        addRow.addView(Button(this).apply {
+            text = "+ TRIGGER BẬT"
+            setOnClickListener { showRuleDialog(null, null, RuleAction.START) }
+        }, weightParams())
+        addRow.addView(Button(this).apply {
+            text = "+ TRIGGER TẮT"
+            setOnClickListener { showRuleDialog(null, null, RuleAction.STOP) }
+        }, weightParams())
+        root.addView(addRow)
+
         rulesContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(8), 0, 0)
@@ -305,9 +309,7 @@ class MainActivity : Activity() {
                     volumeLabel.text = "Âm lượng xi nhan: $progress%"
                     if (fromUser) SettingsStore.setVolume(this@MainActivity, progress / 100f)
                 }
-
                 override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-
                 override fun onStopTrackingTouch(seekBar: SeekBar?) {
                     sendServiceAction(TurnSignalService.ACTION_REFRESH)
                 }
@@ -339,18 +341,15 @@ class MainActivity : Activity() {
             text = "Trạng thái bật/tắt và âm lượng được lưu lại. Đóng app, mở lại hoặc khởi động lại đầu DUDU không cần cấu hình lại."
             setPadding(0, dp(10), 0, dp(6))
         })
-
         root.addView(TextView(this).apply {
-            text = "only_tik_tok.mp3 được giải mã một lần khi service khởi động thành PCM và giữ trong RAM. AudioTrack MODE_STREAM cùng worker ưu tiên audio phát vòng trực tiếp từ PCM, nên khi CAN match không decode MP3 và không tạo player mới. App không yêu cầu Audio Focus nên được thiết kế để trộn cùng nhạc/Vietmap/CarPlay thay vì chủ động dừng nguồn khác."
+            text = "only_tik_tok.mp3 được giải mã một lần khi service khởi động thành PCM và giữ trong RAM. AudioTrack MODE_STREAM cùng worker ưu tiên audio phát vòng trực tiếp từ PCM, nên khi rule match không decode MP3 và không tạo player mới."
             setPadding(0, dp(8), 0, dp(10))
         })
-
         root.addView(TextView(this).apply {
-            text = "TỰ KHỞI ĐỘNG\n\nKhởi động lại Android hoàn toàn: app tự xử lý bằng BOOT_COMPLETED + foreground service.\n\nDUDUOS 3.7 sleep/wake: tạo một Automatic Task:\nVehicle ignition → Open app → FYT Turn Sound - Chạy nền\n\nMục Chạy nền chỉ khởi động service rồi đóng Activity trong suốt ngay, vì vậy màn hình cấu hình không nằm đè lên giao diện DUDU."
+            text = "TỰ KHỞI ĐỘNG\n\nKhởi động lại Android hoàn toàn: app tự xử lý bằng BOOT_COMPLETED + foreground service.\n\nDUDUOS 3.7 sleep/wake: tạo một Automatic Task:\nVehicle ignition → Open app → FYT Turn Sound - Chạy nền"
             textSize = 15f
             setPadding(0, dp(8), 0, dp(8))
         })
-
         root.addView(Button(this).apply {
             text = "KHỞI ĐỘNG / LÀM MỚI DỊCH VỤ"
             setOnClickListener { startTurnService(); sendServiceAction(TurnSignalService.ACTION_REFRESH) }
@@ -371,9 +370,19 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(8), dp(20), dp(4))
         }
-        root.addView(TextView(this).apply {
-            text = "CANBUS index cần lọc"
-        })
+
+        root.addView(TextView(this).apply { text = "Nguồn cần lọc" })
+        val moduleSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                listOf(RuleModule.CANBUS.name, RuleModule.MAIN.name)
+            )
+            setSelection(if (SettingsStore.monitorFilterModule(this@MainActivity) == RuleModule.MAIN.name) 1 else 0)
+        }
+        root.addView(moduleSpinner)
+
+        root.addView(TextView(this).apply { text = "Index cần lọc" })
         val indexEdit = EditText(this).apply {
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
             setText(SettingsStore.monitorFilterIndex(this@MainActivity).toString())
@@ -381,7 +390,7 @@ class MainActivity : Activity() {
         }
         root.addView(indexEdit)
         root.addView(TextView(this).apply {
-            text = "Filter chỉ tác động phần log/monitor. Rule phát âm thanh vẫn nhận CAN đầy đủ."
+            text = "Filter chỉ tác động monitor/log, không thay đổi rule phát âm thanh."
             setPadding(0, dp(8), 0, dp(4))
         })
 
@@ -390,14 +399,10 @@ class MainActivity : Activity() {
             MonitorFilterMode.ONLY_CAN_INDEX -> 1
             MonitorFilterMode.EXCLUDE_CAN_INDEX -> 2
         }
-        val choices = arrayOf(
-            "Tất cả log",
-            "Chỉ hiện CANBUS:index này",
-            "Loại trừ CANBUS:index này"
-        )
+        val choices = arrayOf("Tất cả log", "Chỉ hiện nguồn:index này", "Loại trừ nguồn:index này")
 
         val dialog = AlertDialog.Builder(this)
-            .setTitle("Bộ lọc log CANBUS")
+            .setTitle("Bộ lọc log FYT")
             .setView(root)
             .setSingleChoiceItems(choices, selected) { _, which -> selected = which }
             .setNegativeButton("HỦY", null)
@@ -408,7 +413,7 @@ class MainActivity : Activity() {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 val index = indexEdit.text.toString().toIntOrNull()
                 if (selected != 0 && (index == null || index < 0)) {
-                    toast("CANBUS index phải là số từ 0 trở lên")
+                    toast("Index phải là số từ 0 trở lên")
                     return@setOnClickListener
                 }
                 val mode = when (selected) {
@@ -416,9 +421,10 @@ class MainActivity : Activity() {
                     2 -> MonitorFilterMode.EXCLUDE_CAN_INDEX
                     else -> MonitorFilterMode.ALL
                 }
+                val module = moduleSpinner.selectedItem.toString()
                 val safeIndex = index ?: SettingsStore.monitorFilterIndex(this)
-                SettingsStore.setMonitorFilter(this, mode, safeIndex)
-                MonitorStore.configureFilter(mode, safeIndex)
+                SettingsStore.setMonitorFilter(this, mode, module, safeIndex)
+                MonitorStore.configureFilter(mode, module, safeIndex)
                 filterStatusText.text = "Bộ lọc log: ${MonitorStore.filterSummary()} • monitor chỉ capture khi tab Giám sát đang mở"
                 lastMonitorVersion = -1L
                 refreshMonitor()
@@ -431,27 +437,34 @@ class MainActivity : Activity() {
     }
 
     private fun refreshMonitor() {
-        val latest = MonitorStore.latestCanEvent
-        latestCanText.text = if (latest == null) {
-            "CANBUS mới nhất: đang chờ..."
+        val latest = MonitorStore.latestRuleEvent
+        latestEventText.text = if (latest == null) {
+            "CANBUS/MAIN mới nhất: đang chờ..."
         } else {
-            "CANBUS mới nhất: ${latest.originalStyleLine()}"
+            "CANBUS/MAIN mới nhất: ${latest.originalStyleLine()}"
         }
         if (monitorPaused || MonitorStore.version == lastMonitorVersion) return
         lastMonitorVersion = MonitorStore.version
         val text = MonitorStore.snapshot()
-        monitorText.text = if (text.isBlank()) "Đang chờ dữ liệu FYT CAN..." else text
+        monitorText.text = if (text.isBlank()) "Đang chờ dữ liệu FYT..." else text
         monitorScroll.post { monitorScroll.fullScroll(View.FOCUS_DOWN) }
     }
 
     private fun refreshStatus() {
         val error = RuntimeState.lastError?.let { "\nLỗi gần nhất: $it" } ?: ""
+        val state = RuleStateSnapshot(
+            RuntimeState.leftActive,
+            RuntimeState.rightActive,
+            RuntimeState.hazardActive
+        )
+        val stopText = if (SettingsStore.stopMode(this) == StopMode.TRIGGER) "TRIGGER TẮT" else "TIMEOUT 1,5s"
         serviceStatusText.text = buildString {
             append("Dịch vụ: ").append(if (RuntimeState.serviceRunning) "ĐANG CHẠY" else "ĐÃ DỪNG")
             append("\nGói FYT: ").append(if (RuntimeState.fytPackagePresent) "CÓ SẴN" else "KHÔNG CÓ - chế độ thử điện thoại")
             append("\nFYT com.syu.ms: ").append(if (RuntimeState.fytConnected) "ĐÃ KẾT NỐI" else "ĐANG CHỜ")
             append("\nMẫu âm thanh: ").append(if (RuntimeState.audioReady) "ĐÃ NẠP RAM" else "ĐANG NẠP")
-            append("\nCó luật đang khớp: ").append(if (RuntimeState.ruleActive) "CÓ" else "KHÔNG")
+            append("\nNhóm đang active: ").append(state.summary())
+            append("\nCách tắt: ").append(stopText)
             append(error)
         }
     }
@@ -462,11 +475,12 @@ class MainActivity : Activity() {
         rulesContainer.removeAllViews()
         if (rules.isEmpty()) {
             rulesContainer.addView(TextView(this).apply {
-                text = "Chưa có luật. Hãy bật xi nhan trong tab Giám sát, sau đó dùng sự kiện CAN mới nhất hoặc thêm luật thủ công."
+                text = "Chưa có trigger. Mở tab Giám sát, thao tác xi nhan/hazard rồi dùng sự kiện CANBUS/MAIN mới nhất để tạo trigger."
                 setPadding(0, dp(8), 0, dp(8))
             })
             return
         }
+
         rules.forEach { rule ->
             val card = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
@@ -487,7 +501,7 @@ class MainActivity : Activity() {
             val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             row.addView(Button(this).apply {
                 text = "SỬA"
-                setOnClickListener { showRuleDialog(rule, null) }
+                setOnClickListener { showRuleDialog(rule, null, rule.action) }
             }, weightParams())
             row.addView(Button(this).apply {
                 text = "XÓA"
@@ -501,44 +515,60 @@ class MainActivity : Activity() {
             card.addView(row)
             rulesContainer.addView(
                 card,
-                LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(8) }
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                    bottomMargin = dp(8)
+                }
             )
         }
     }
 
-    private fun showRuleDialog(existing: CanRule?, event: FytEvent?) {
-        val base = existing?.copy() ?: run {
-            val first = event?.ints?.getOrNull(0) ?: 0
-            CanRule(
-                index = event?.index ?: 0,
-                position = 0,
-                expectedValue = if (first < 0) first and 0xFF else first,
-                unsignedByte = first < 0
-            )
-        }
+    private fun showRuleDialog(existing: CanRule?, event: FytEvent?, defaultAction: RuleAction) {
+        val eventModule = RuleModule.values().firstOrNull { it.name == event?.module } ?: RuleModule.CANBUS
+        val first = event?.ints?.getOrNull(0) ?: 0
+        val base = existing?.copy() ?: CanRule(
+            module = eventModule,
+            action = defaultAction,
+            target = SignalTarget.LEFT,
+            index = event?.index ?: 0,
+            position = 0,
+            expectedValue = if (first < 0) first and 0xFF else first,
+            unsignedByte = first < 0
+        )
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(8), dp(20), dp(4))
         }
 
+        fun addSpinner(label: String, values: List<String>, selected: Int): Spinner {
+            root.addView(TextView(this).apply { text = label })
+            val spinner = Spinner(this).apply {
+                adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, values)
+                setSelection(selected.coerceIn(0, values.lastIndex))
+            }
+            root.addView(spinner)
+            return spinner
+        }
+
         fun numberField(label: String, value: Int): EditText {
+            root.addView(TextView(this).apply { text = label })
             val edit = EditText(this).apply {
                 hint = label
-                inputType = android.text.InputType.TYPE_CLASS_NUMBER or
-                    android.text.InputType.TYPE_NUMBER_FLAG_SIGNED
+                inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_SIGNED
                 setText(value.toString())
                 selectAll()
             }
-            root.addView(TextView(this).apply { text = label })
             root.addView(edit)
             return edit
         }
 
-        val indexEdit = numberField("CANBUS index", base.index)
+        val moduleValues = RuleModule.values()
+        val actionValues = RuleAction.values()
+        val targetValues = SignalTarget.values()
+        val moduleSpinner = addSpinner("Nguồn", moduleValues.map { it.name }, moduleValues.indexOf(base.module))
+        val actionSpinner = addSpinner("Hành động", actionValues.map { it.label() }, actionValues.indexOf(base.action))
+        val targetSpinner = addSpinner("Map vào", targetValues.map { it.label() }, targetValues.indexOf(base.target))
+        val indexEdit = numberField("Index", base.index)
         val positionEdit = numberField("Vị trí trong IntArray", base.position)
         val valueEdit = numberField("Giá trị cần khớp", base.expectedValue)
         val unsigned = CheckBox(this).apply {
@@ -546,6 +576,7 @@ class MainActivity : Activity() {
             isChecked = base.unsignedByte
         }
         root.addView(unsigned)
+
         event?.let {
             root.addView(TextView(this).apply {
                 text = "Dữ liệu bắt được: ${it.originalStyleLine()}"
@@ -555,11 +586,12 @@ class MainActivity : Activity() {
         }
 
         val dialog = AlertDialog.Builder(this)
-            .setTitle(if (existing == null) "Thêm luật CAN" else "Sửa luật CAN")
+            .setTitle(if (existing == null) "Thêm trigger FYT" else "Sửa trigger FYT")
             .setView(root)
             .setNegativeButton("HỦY", null)
             .setPositiveButton("LƯU", null)
             .create()
+
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 val idx = indexEdit.text.toString().toIntOrNull()
@@ -569,8 +601,12 @@ class MainActivity : Activity() {
                     toast("Index, vị trí và giá trị phải là số hợp lệ")
                     return@setOnClickListener
                 }
+
                 val rules = RuleStore.load(this)
                 val updated = base.copy(
+                    module = moduleValues[moduleSpinner.selectedItemPosition],
+                    action = actionValues[actionSpinner.selectedItemPosition],
+                    target = targetValues[targetSpinner.selectedItemPosition],
                     index = idx,
                     position = pos,
                     expectedValue = value,
@@ -595,15 +631,13 @@ class MainActivity : Activity() {
         }
         try {
             val values = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, "FYT-CAN-${timestampForFile()}.txt")
+                put(MediaStore.MediaColumns.DISPLAY_NAME, "FYT-${timestampForFile()}.txt")
                 put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
                 put(MediaStore.MediaColumns.RELATIVE_PATH, "Download")
             }
             val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                 ?: throw IllegalStateException("MediaStore trả về null")
-            contentResolver.openOutputStream(uri, "w")!!.use { out ->
-                out.write(log.toByteArray(Charsets.UTF_8))
-            }
+            contentResolver.openOutputStream(uri, "w")!!.use { out -> out.write(log.toByteArray(Charsets.UTF_8)) }
             toast("Đã lưu vào thư mục Download")
         } catch (t: Throwable) {
             toast("Xuất log thất bại: ${t.message}")
@@ -620,9 +654,7 @@ class MainActivity : Activity() {
 
     private fun sendServiceAction(action: String) {
         try {
-            startForegroundService(
-                Intent(this, TurnSignalService::class.java).apply { this.action = action }
-            )
+            startForegroundService(Intent(this, TurnSignalService::class.java).apply { this.action = action })
         } catch (t: Throwable) {
             RuntimeState.lastError = "Lệnh dịch vụ: ${t.javaClass.simpleName}: ${t.message}"
         }
@@ -631,10 +663,8 @@ class MainActivity : Activity() {
     private fun requestNotificationPermissionIfNeeded() {
         if (Build.VERSION.SDK_INT < 33) return
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return
-
         val prefs = getSharedPreferences("turn_sound_ui", MODE_PRIVATE)
         if (prefs.getBoolean("notification_permission_requested", false)) return
-
         prefs.edit().putBoolean("notification_permission_requested", true).apply()
         requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001)
     }
