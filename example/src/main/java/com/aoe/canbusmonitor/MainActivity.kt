@@ -38,6 +38,7 @@ class MainActivity : Activity() {
     private lateinit var monitorScroll: ScrollView
     private var lastMonitorVersion = -1L
     private var monitorPaused = false
+    private var selectedTabIndex = 0
 
     private val refresher = object : Runnable {
         override fun run() {
@@ -57,23 +58,25 @@ class MainActivity : Activity() {
         )
 
         // Dựng giao diện trước khi khởi động service hoặc hiện hộp thoại quyền thông báo.
-        // Nhờ vậy app vẫn dùng được trên điện thoại Android thường để thử giao diện và âm thanh.
         setContentView(buildTabbedUi())
         renderRules()
         startTurnService()
 
-        // Chỉ hỏi quyền sau khi giao diện đã được tạo, tránh lặp hộp thoại nếu Activity bị tạo lại.
         handler.post { requestNotificationPermissionIfNeeded() }
     }
 
     override fun onResume() {
         super.onResume()
+        // Chỉ capture toàn bộ monitor khi đúng tab Giám sát đang mở và không pause.
+        MonitorCaptureState.enabled = selectedTabIndex == 0 && !monitorPaused
         handler.removeCallbacks(refresher)
         handler.post(refresher)
         renderRules()
     }
 
     override fun onPause() {
+        // App chạy nền: non-rule CAN bị bỏ ngay tại Binder callback trước khi copy array.
+        MonitorCaptureState.enabled = false
         handler.removeCallbacks(refresher)
         super.onPause()
     }
@@ -111,11 +114,13 @@ class MainActivity : Activity() {
                 text = label
                 isAllCaps = false
                 setOnClickListener {
+                    selectedTabIndex = pageIndex
+                    MonitorCaptureState.enabled = pageIndex == 0 && !monitorPaused
+
                     pages.forEachIndexed { index, page ->
                         page.visibility = if (index == pageIndex) View.VISIBLE else View.GONE
                     }
                     buttons.forEachIndexed { index, tabButton ->
-                        // Nút bị vô hiệu hóa chính là tab đang được chọn.
                         tabButton.isEnabled = index != pageIndex
                     }
                     if (pageIndex == 1) renderRules()
@@ -153,6 +158,8 @@ class MainActivity : Activity() {
             page.visibility = if (index == 0) View.VISIBLE else View.GONE
         }
         buttons.forEachIndexed { index, button -> button.isEnabled = index != 0 }
+        selectedTabIndex = 0
+        MonitorCaptureState.enabled = !monitorPaused
         return root
     }
 
@@ -173,6 +180,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 monitorPaused = !monitorPaused
                 text = if (monitorPaused) "TIẾP TỤC" else "TẠM DỪNG"
+                MonitorCaptureState.enabled = selectedTabIndex == 0 && !monitorPaused
                 if (!monitorPaused) lastMonitorVersion = -1L
             }
         }
@@ -191,7 +199,7 @@ class MainActivity : Activity() {
         root.addView(controls)
 
         filterStatusText = TextView(this).apply {
-            text = "Bộ lọc log: ${MonitorStore.filterSummary()} • chỉ ảnh hưởng monitor/log, không ảnh hưởng luật phát tiếng"
+            text = "Bộ lọc log: ${MonitorStore.filterSummary()} • monitor chỉ capture khi tab Giám sát đang mở"
             setPadding(0, dp(5), 0, dp(2))
         }
         root.addView(filterStatusText)
@@ -248,7 +256,7 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(10), dp(12), dp(16))
         }
         root.addView(TextView(this).apply {
-            text = "Chỉ cần một luật đang bật khớp dữ liệu CAN là phát âm thanh. Frame match đầu tiên phát ngay; các frame match tiếp theo chỉ giữ trạng thái, không khởi động lại âm thanh. Một khoảng giữ ngắn giúp nối các frame ON/OFF theo nhịp chớp CAN thành một phiên âm thanh liên tục. Hazard vẫn hoạt động nếu bất kỳ luật trái/phải hoặc luật hazard riêng khớp."
+            text = "Chỉ cần một luật đang bật khớp dữ liệu CAN là phát âm thanh. Frame match đầu tiên phát ngay; các frame match tiếp theo chỉ cập nhật heartbeat, không khởi động lại âm thanh. Nếu quá khoảng 1,3 giây không còn frame match nào thì trạng thái mới chuyển về OFF. Hazard vẫn hoạt động nếu bất kỳ luật trái/phải hoặc luật hazard riêng khớp."
             textSize = 15f
             setPadding(0, 0, 0, dp(10))
         })
@@ -333,7 +341,7 @@ class MainActivity : Activity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "File MP3 mới được SoundPool nạp và giải mã ngay khi service khởi tạo, sau đó giữ mẫu âm thanh trong RAM để phản hồi nhanh. Khi phát tới cuối file, SoundPool lặp lại từ đầu ngay lập tức, không chèn thời gian nghỉ. App không yêu cầu Audio Focus nên được thiết kế để trộn cùng nhạc/Vietmap/CarPlay thay vì chủ động dừng hoặc hạ âm lượng các nguồn khác."
+            text = "only_tik_tok.mp3 được giải mã một lần khi service khởi động thành PCM và giữ trong RAM. AudioTrack MODE_STREAM cùng worker ưu tiên audio phát vòng trực tiếp từ PCM, nên khi CAN match không decode MP3 và không tạo player mới. App không yêu cầu Audio Focus nên được thiết kế để trộn cùng nhạc/Vietmap/CarPlay thay vì chủ động dừng nguồn khác."
             setPadding(0, dp(8), 0, dp(10))
         })
 
@@ -411,7 +419,7 @@ class MainActivity : Activity() {
                 val safeIndex = index ?: SettingsStore.monitorFilterIndex(this)
                 SettingsStore.setMonitorFilter(this, mode, safeIndex)
                 MonitorStore.configureFilter(mode, safeIndex)
-                filterStatusText.text = "Bộ lọc log: ${MonitorStore.filterSummary()} • chỉ ảnh hưởng monitor/log, không ảnh hưởng luật phát tiếng"
+                filterStatusText.text = "Bộ lọc log: ${MonitorStore.filterSummary()} • monitor chỉ capture khi tab Giám sát đang mở"
                 lastMonitorVersion = -1L
                 refreshMonitor()
                 sendServiceAction(TurnSignalService.ACTION_REFRESH)
@@ -627,7 +635,6 @@ class MainActivity : Activity() {
         val prefs = getSharedPreferences("turn_sound_ui", MODE_PRIVATE)
         if (prefs.getBoolean("notification_permission_requested", false)) return
 
-        // Ghi trạng thái trước khi mở hộp thoại hệ thống để không hỏi quyền lặp lại.
         prefs.edit().putBoolean("notification_permission_requested", true).apply()
         requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001)
     }
