@@ -585,12 +585,24 @@ class MainActivity : Activity() {
             })
         }
 
-        val dialog = AlertDialog.Builder(this)
-            .setTitle(if (existing == null) "Thêm trigger FYT" else "Sửa trigger FYT")
-            .setView(root)
-            .setNegativeButton("HỦY", null)
-            .setPositiveButton("LƯU", null)
-            .create()
+        val scroll = ScrollView(this).apply {
+    isFillViewport = true
+    overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+}
+scroll.addView(
+    root,
+    ViewGroup.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT
+    )
+)
+
+val dialog = AlertDialog.Builder(this)
+    .setTitle(if (existing == null) "Thêm trigger FYT" else "Sửa trigger FYT")
+    .setView(scroll)
+    .setNegativeButton("HỦY", null)
+    .setPositiveButton("LƯU", null)
+    .create()
 
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
