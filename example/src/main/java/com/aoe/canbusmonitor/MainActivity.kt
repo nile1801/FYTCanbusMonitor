@@ -279,7 +279,7 @@ class MainActivity : Activity() {
                 override fun onStartTrackingTouch(seekBar: SeekBar?) {}
 
                 override fun onStopTrackingTouch(seekBar: SeekBar?) {
-                    val value = timeoutSeek.progress * SettingsStore.TIMEOUT_STEP_MS
+                    val value = (seekBar?.progress ?: 0) * SettingsStore.TIMEOUT_STEP_MS
                     SettingsStore.setTimeoutMillis(this@MainActivity, value)
                     sendServiceAction(TurnSignalService.ACTION_REFRESH)
                 }
