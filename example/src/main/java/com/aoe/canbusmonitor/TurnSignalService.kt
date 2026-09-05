@@ -46,14 +46,14 @@ class TurnSignalService : Service() {
         MonitorStore.configureFilter(
             SettingsStore.monitorFilterMode(this),
             SettingsStore.monitorFilterModule(this),
-            SettingsStore.monitorFilterIndex(this)
+            SettingsStore.monitorFilterIndexes(this)
         )
 
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
 
         audio = AudioEngine(this)
-        ruleEngine = RuleEngine { state ->
+        ruleEngine = RuleEngine(SettingsStore.timeoutMillis(this).toLong()) { state ->
             RuntimeState.leftActive = state.left
             RuntimeState.rightActive = state.right
             RuntimeState.hazardActive = state.hazard
@@ -154,8 +154,9 @@ class TurnSignalService : Service() {
         MonitorStore.configureFilter(
             SettingsStore.monitorFilterMode(this),
             SettingsStore.monitorFilterModule(this),
-            SettingsStore.monitorFilterIndex(this)
+            SettingsStore.monitorFilterIndexes(this)
         )
+        ruleEngine.setHoldMillis(SettingsStore.timeoutMillis(this).toLong())
         ruleEngine.setStopMode(SettingsStore.stopMode(this))
         ruleEngine.setRules(RuleStore.load(this))
         audio.setVolume(SettingsStore.volume(this))

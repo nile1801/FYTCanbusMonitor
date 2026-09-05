@@ -58,7 +58,7 @@ class MainActivity : Activity() {
         MonitorStore.configureFilter(
             SettingsStore.monitorFilterMode(this),
             SettingsStore.monitorFilterModule(this),
-            SettingsStore.monitorFilterIndex(this)
+            SettingsStore.monitorFilterIndexes(this)
         )
 
         setContentView(buildTabbedUi())
@@ -133,7 +133,10 @@ class MainActivity : Activity() {
         addTabButton("Luật CAN / MAIN", 1)
         addTabButton("Âm thanh & dịch vụ", 2)
 
-        root.addView(tabBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(
+            tabBar,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        )
         root.addView(content, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         pages.forEachIndexed { index, page -> page.visibility = if (index == 0) View.VISIBLE else View.GONE }
@@ -152,7 +155,11 @@ class MainActivity : Activity() {
         val controls = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val clear = Button(this).apply {
             text = "XÓA"
-            setOnClickListener { MonitorStore.clear(); lastMonitorVersion = -1L; refreshMonitor() }
+            setOnClickListener {
+                MonitorStore.clear()
+                lastMonitorVersion = -1L
+                refreshMonitor()
+            }
         }
         val pause = Button(this).apply {
             text = "TẠM DỪNG"
@@ -209,7 +216,10 @@ class MainActivity : Activity() {
             setPadding(dp(4), dp(6), dp(4), dp(12))
             text = "Đang chờ dữ liệu FYT..."
         }
-        monitorScroll.addView(monitorText, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        monitorScroll.addView(
+            monitorText,
+            ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        )
         root.addView(monitorScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         return root
     }
@@ -222,9 +232,14 @@ class MainActivity : Activity() {
         }
 
         root.addView(TextView(this).apply {
-            text = "Mỗi trigger có Nguồn (CANBUS/MAIN), Hành động (BẬT/TẮT) và Nhóm (TRÁI/PHẢI/HAZARD). Các nhóm có state riêng. Rule cũ được giữ lại và mặc định đọc là CANBUS + BẬT + TRÁI; hãy sửa mapping nếu cần."
+            text = "Mỗi trigger có Nguồn (CANBUS/MAIN), Hành động (BẬT/TẮT) và Nhóm (TRÁI/PHẢI/HAZARD). Các nhóm có state riêng. Rule cũ chỉ có CANBUS vẫn restore được và mặc định field mới là CANBUS + BẬT + TRÁI."
             textSize = 15f
             setPadding(0, 0, 0, dp(8))
+        })
+
+        root.addView(TextView(this).apply {
+            text = "Backup rule tự động: ${RuleBackupStore.DISPLAY_PATH}. File nằm ngoài vùng dữ liệu riêng của app; khi cài lại app sẽ thử tìm và restore từng rule đọc được."
+            setPadding(0, 0, 0, dp(10))
         })
 
         root.addView(TextView(this).apply {
@@ -238,19 +253,50 @@ class MainActivity : Activity() {
         val triggerId = View.generateViewId()
         stopModeGroup.addView(RadioButton(this).apply {
             id = timeoutId
-            text = "Tắt sau 1,5 giây không còn trigger BẬT match"
+            text = "Tắt sau thời gian timeout đã cấu hình khi không còn trigger BẬT match"
         })
         stopModeGroup.addView(RadioButton(this).apply {
             id = triggerId
             text = "Chỉ tắt khi trigger TẮT của đúng nhóm match"
         })
         stopModeGroup.check(if (SettingsStore.stopMode(this) == StopMode.TRIGGER) triggerId else timeoutId)
+        root.addView(stopModeGroup)
+
+        val timeoutLabel = TextView(this).apply {
+            textSize = 15f
+            setPadding(0, dp(8), 0, 0)
+        }
+        root.addView(timeoutLabel)
+
+        val timeoutSeek = SeekBar(this).apply {
+            max = SettingsStore.MAX_TIMEOUT_MS / SettingsStore.TIMEOUT_STEP_MS
+            progress = SettingsStore.timeoutMillis(this@MainActivity) / SettingsStore.TIMEOUT_STEP_MS
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    timeoutLabel.text = "Timeout: ${progress * SettingsStore.TIMEOUT_STEP_MS} ms"
+                }
+
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                    val value = timeoutSeek.progress * SettingsStore.TIMEOUT_STEP_MS
+                    SettingsStore.setTimeoutMillis(this@MainActivity, value)
+                    sendServiceAction(TurnSignalService.ACTION_REFRESH)
+                }
+            })
+        }
+        timeoutLabel.text = "Timeout: ${timeoutSeek.progress * SettingsStore.TIMEOUT_STEP_MS} ms"
+        root.addView(timeoutSeek)
+        root.addView(TextView(this).apply {
+            text = "Khoảng chỉnh: 0–2000 ms, mỗi nấc 100 ms. Chỉ áp dụng khi chọn chế độ TIMEOUT."
+            setPadding(0, 0, 0, dp(8))
+        })
+
         stopModeGroup.setOnCheckedChangeListener { _, checkedId ->
             val mode = if (checkedId == triggerId) StopMode.TRIGGER else StopMode.TIMEOUT
             SettingsStore.setStopMode(this, mode)
             sendServiceAction(TurnSignalService.ACTION_REFRESH)
         }
-        root.addView(stopModeGroup)
 
         root.addView(TextView(this).apply {
             text = "Ở chế độ trigger TẮT, app không tự timeout. Ví dụ TRÁI đã BẬT thì chỉ trigger TẮT map vào TRÁI mới tắt. PHẢI/HAZARD không tắt chéo nhau."
@@ -309,7 +355,9 @@ class MainActivity : Activity() {
                     volumeLabel.text = "Âm lượng xi nhan: $progress%"
                     if (fromUser) SettingsStore.setVolume(this@MainActivity, progress / 100f)
                 }
+
                 override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
                 override fun onStopTrackingTouch(seekBar: SeekBar?) {
                     sendServiceAction(TurnSignalService.ACTION_REFRESH)
                 }
@@ -352,7 +400,10 @@ class MainActivity : Activity() {
         })
         root.addView(Button(this).apply {
             text = "KHỞI ĐỘNG / LÀM MỚI DỊCH VỤ"
-            setOnClickListener { startTurnService(); sendServiceAction(TurnSignalService.ACTION_REFRESH) }
+            setOnClickListener {
+                startTurnService()
+                sendServiceAction(TurnSignalService.ACTION_REFRESH)
+            }
         })
         scroll.addView(root)
         return scroll
@@ -382,15 +433,16 @@ class MainActivity : Activity() {
         }
         root.addView(moduleSpinner)
 
-        root.addView(TextView(this).apply { text = "Index cần lọc" })
+        root.addView(TextView(this).apply { text = "Các index cần lọc" })
         val indexEdit = EditText(this).apply {
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
-            setText(SettingsStore.monitorFilterIndex(this@MainActivity).toString())
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+            hint = "Ví dụ: 1019, 1049"
+            setText(SettingsStore.monitorFilterIndexes(this@MainActivity).sorted().joinToString(", "))
             selectAll()
         }
         root.addView(indexEdit)
         root.addView(TextView(this).apply {
-            text = "Filter chỉ tác động monitor/log, không thay đổi rule phát âm thanh."
+            text = "Có thể nhập nhiều index, ngăn cách bằng dấu phẩy. Ví dụ: 1019, 1049. Cách nhập này dùng cho cả Chỉ hiện và Loại trừ. Filter chỉ tác động monitor/log, không thay đổi rule phát âm thanh."
             setPadding(0, dp(8), 0, dp(4))
         })
 
@@ -399,7 +451,11 @@ class MainActivity : Activity() {
             MonitorFilterMode.ONLY_CAN_INDEX -> 1
             MonitorFilterMode.EXCLUDE_CAN_INDEX -> 2
         }
-        val choices = arrayOf("Tất cả log", "Chỉ hiện nguồn:index này", "Loại trừ nguồn:index này")
+        val choices = arrayOf(
+            "Tất cả log",
+            "Chỉ hiện các index đã nhập của nguồn này",
+            "Loại trừ các index đã nhập của nguồn này"
+        )
 
         val dialog = AlertDialog.Builder(this)
             .setTitle("Bộ lọc log FYT")
@@ -411,9 +467,9 @@ class MainActivity : Activity() {
 
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val index = indexEdit.text.toString().toIntOrNull()
-                if (selected != 0 && (index == null || index < 0)) {
-                    toast("Index phải là số từ 0 trở lên")
+                val parsedIndexes = parseIndexList(indexEdit.text.toString())
+                if (selected != 0 && parsedIndexes == null) {
+                    toast("Nhập index từ 0 trở lên, nhiều index ngăn cách bằng dấu phẩy")
                     return@setOnClickListener
                 }
                 val mode = when (selected) {
@@ -422,9 +478,9 @@ class MainActivity : Activity() {
                     else -> MonitorFilterMode.ALL
                 }
                 val module = moduleSpinner.selectedItem.toString()
-                val safeIndex = index ?: SettingsStore.monitorFilterIndex(this)
-                SettingsStore.setMonitorFilter(this, mode, module, safeIndex)
-                MonitorStore.configureFilter(mode, module, safeIndex)
+                val safeIndexes = parsedIndexes ?: SettingsStore.monitorFilterIndexes(this)
+                SettingsStore.setMonitorFilter(this, mode, module, safeIndexes)
+                MonitorStore.configureFilter(mode, module, safeIndexes)
                 filterStatusText.text = "Bộ lọc log: ${MonitorStore.filterSummary()} • monitor chỉ capture khi tab Giám sát đang mở"
                 lastMonitorVersion = -1L
                 refreshMonitor()
@@ -434,6 +490,18 @@ class MainActivity : Activity() {
             }
         }
         dialog.show()
+    }
+
+    private fun parseIndexList(text: String): Set<Int>? {
+        val parts = text.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+        if (parts.isEmpty()) return null
+        val out = linkedSetOf<Int>()
+        for (part in parts) {
+            val value = part.toIntOrNull() ?: return null
+            if (value < 0) return null
+            out += value
+        }
+        return out
     }
 
     private fun refreshMonitor() {
@@ -457,7 +525,11 @@ class MainActivity : Activity() {
             RuntimeState.rightActive,
             RuntimeState.hazardActive
         )
-        val stopText = if (SettingsStore.stopMode(this) == StopMode.TRIGGER) "TRIGGER TẮT" else "TIMEOUT 1,5s"
+        val stopText = if (SettingsStore.stopMode(this) == StopMode.TRIGGER) {
+            "TRIGGER TẮT"
+        } else {
+            "TIMEOUT ${SettingsStore.timeoutMillis(this)} ms"
+        }
         serviceStatusText.text = buildString {
             append("Dịch vụ: ").append(if (RuntimeState.serviceRunning) "ĐANG CHẠY" else "ĐÃ DỪNG")
             append("\nGói FYT: ").append(if (RuntimeState.fytPackagePresent) "CÓ SẴN" else "KHÔNG CÓ - chế độ thử điện thoại")
@@ -472,6 +544,7 @@ class MainActivity : Activity() {
     private fun renderRules() {
         if (!::rulesContainer.isInitialized) return
         val rules = RuleStore.load(this)
+        RuleStore.consumeStatusMessage()?.let { toast(it) }
         rulesContainer.removeAllViews()
         if (rules.isEmpty()) {
             rulesContainer.addView(TextView(this).apply {
@@ -515,9 +588,10 @@ class MainActivity : Activity() {
             card.addView(row)
             rulesContainer.addView(
                 card,
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                    bottomMargin = dp(8)
-                }
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(8) }
             )
         }
     }
@@ -543,7 +617,11 @@ class MainActivity : Activity() {
         fun addSpinner(label: String, values: List<String>, selected: Int): Spinner {
             root.addView(TextView(this).apply { text = label })
             val spinner = Spinner(this).apply {
-                adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, values)
+                adapter = ArrayAdapter(
+                    this@MainActivity,
+                    android.R.layout.simple_spinner_dropdown_item,
+                    values
+                )
                 setSelection(selected.coerceIn(0, values.lastIndex))
             }
             root.addView(spinner)
@@ -554,7 +632,8 @@ class MainActivity : Activity() {
             root.addView(TextView(this).apply { text = label })
             val edit = EditText(this).apply {
                 hint = label
-                inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_SIGNED
+                inputType = android.text.InputType.TYPE_CLASS_NUMBER or
+                    android.text.InputType.TYPE_NUMBER_FLAG_SIGNED
                 setText(value.toString())
                 selectAll()
             }
@@ -585,24 +664,24 @@ class MainActivity : Activity() {
             })
         }
 
-        val scroll = ScrollView(this).apply {
-    isFillViewport = true
-    overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
-}
-scroll.addView(
-    root,
-    ViewGroup.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT
-    )
-)
+        val dialogScroll = ScrollView(this).apply {
+            isFillViewport = true
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+        }
+        dialogScroll.addView(
+            root,
+            ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
 
-val dialog = AlertDialog.Builder(this)
-    .setTitle(if (existing == null) "Thêm trigger FYT" else "Sửa trigger FYT")
-    .setView(scroll)
-    .setNegativeButton("HỦY", null)
-    .setPositiveButton("LƯU", null)
-    .create()
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(if (existing == null) "Thêm trigger FYT" else "Sửa trigger FYT")
+            .setView(dialogScroll)
+            .setNegativeButton("HỦY", null)
+            .setPositiveButton("LƯU", null)
+            .create()
 
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
@@ -649,7 +728,9 @@ val dialog = AlertDialog.Builder(this)
             }
             val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                 ?: throw IllegalStateException("MediaStore trả về null")
-            contentResolver.openOutputStream(uri, "w")!!.use { out -> out.write(log.toByteArray(Charsets.UTF_8)) }
+            contentResolver.openOutputStream(uri, "w")!!.use { out ->
+                out.write(log.toByteArray(Charsets.UTF_8))
+            }
             toast("Đã lưu vào thư mục Download")
         } catch (t: Throwable) {
             toast("Xuất log thất bại: ${t.message}")

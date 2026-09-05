@@ -53,7 +53,7 @@ object MonitorStore {
 
     @Volatile private var filterMode: MonitorFilterMode = MonitorFilterMode.ALL
     @Volatile private var filterModule: String = RuleModule.CANBUS.name
-    @Volatile private var filterIndex: Int = 0
+    @Volatile private var filterIndexes: Set<Int> = emptySet()
 
     @Volatile var version: Long = 0L
         private set
@@ -62,34 +62,43 @@ object MonitorStore {
     @Volatile var latestRuleEvent: FytEvent? = null
         private set
 
-    /** Fast-path: không lock, không allocation. */
+    /** Fast-path: không lock, không tạo object mới. */
     fun shouldQueueFast(module: String, index: Int): Boolean {
         return when (filterMode) {
             MonitorFilterMode.ALL -> true
-            MonitorFilterMode.ONLY_CAN_INDEX -> module == filterModule && index == filterIndex
-            MonitorFilterMode.EXCLUDE_CAN_INDEX -> !(module == filterModule && index == filterIndex)
+            MonitorFilterMode.ONLY_CAN_INDEX -> module == filterModule && index in filterIndexes
+            MonitorFilterMode.EXCLUDE_CAN_INDEX -> !(module == filterModule && index in filterIndexes)
         }
     }
 
     @Synchronized
-    fun configureFilter(mode: MonitorFilterMode, module: String, index: Int) {
+    fun configureFilter(mode: MonitorFilterMode, module: String, indexes: Set<Int>) {
         val safeModule = if (module == RuleModule.MAIN.name) RuleModule.MAIN.name else RuleModule.CANBUS.name
-        val safeIndex = index.coerceAtLeast(0)
-        if (filterMode == mode && filterModule == safeModule && filterIndex == safeIndex) return
+        val safeIndexes = indexes.asSequence().filter { it >= 0 }.toSortedSet()
+        if (filterMode == mode && filterModule == safeModule && filterIndexes == safeIndexes) return
         filterMode = mode
         filterModule = safeModule
-        filterIndex = safeIndex
+        filterIndexes = safeIndexes
         clearLocked()
+    }
+
+    /** Backward-compatible overload cho code cũ. */
+    fun configureFilter(mode: MonitorFilterMode, module: String, index: Int) {
+        configureFilter(mode, module, setOf(index.coerceAtLeast(0)))
     }
 
     fun currentFilterMode(): MonitorFilterMode = filterMode
     fun currentFilterModule(): String = filterModule
-    fun currentFilterIndex(): Int = filterIndex
+    fun currentFilterIndexes(): Set<Int> = filterIndexes
+    fun currentFilterIndex(): Int = filterIndexes.firstOrNull() ?: 0
 
-    fun filterSummary(): String = when (filterMode) {
-        MonitorFilterMode.ALL -> "Tất cả log"
-        MonitorFilterMode.ONLY_CAN_INDEX -> "Chỉ $filterModule:$filterIndex"
-        MonitorFilterMode.EXCLUDE_CAN_INDEX -> "Loại trừ $filterModule:$filterIndex"
+    fun filterSummary(): String {
+        val indexes = filterIndexes.sorted().joinToString(", ")
+        return when (filterMode) {
+            MonitorFilterMode.ALL -> "Tất cả log"
+            MonitorFilterMode.ONLY_CAN_INDEX -> "Chỉ $filterModule:[$indexes]"
+            MonitorFilterMode.EXCLUDE_CAN_INDEX -> "Loại trừ $filterModule:[$indexes]"
+        }
     }
 
     @Synchronized
@@ -182,42 +191,71 @@ data class CanRule(
 object RuleStore {
     private const val PREFS = "turn_sound_rules"
     private const val KEY = "rules_json"
+    private const val BACKUP_SCHEMA_VERSION = 2
+
+    private data class ParseResult(
+        val rules: MutableList<CanRule>,
+        val skipped: Int
+    )
+
+    @Volatile private var pendingStatusMessage: String? = null
+
+    fun consumeStatusMessage(): String? {
+        val message = pendingStatusMessage
+        pendingStatusMessage = null
+        return message
+    }
 
     fun load(context: Context): MutableList<CanRule> {
-        val text = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, "[]") ?: "[]"
-        val out = mutableListOf<CanRule>()
-        try {
-            val array = JSONArray(text)
-            for (i in 0 until array.length()) {
-                val o = array.getJSONObject(i)
-                val module = runCatching {
-                    RuleModule.valueOf(o.optString("module", RuleModule.CANBUS.name))
-                }.getOrDefault(RuleModule.CANBUS)
-                val action = runCatching {
-                    RuleAction.valueOf(o.optString("action", RuleAction.START.name))
-                }.getOrDefault(RuleAction.START)
-                val target = runCatching {
-                    SignalTarget.valueOf(o.optString("target", SignalTarget.LEFT.name))
-                }.getOrDefault(SignalTarget.LEFT)
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-                out += CanRule(
-                    id = o.optString("id", UUID.randomUUID().toString()),
-                    enabled = o.optBoolean("enabled", true),
-                    module = module,
-                    action = action,
-                    target = target,
-                    index = o.optInt("index", 0),
-                    position = o.optInt("position", 0),
-                    expectedValue = o.optInt("expected", 0),
-                    unsignedByte = o.optBoolean("unsigned", false)
-                )
+        if (prefs.contains(KEY)) {
+            val localText = prefs.getString(KEY, "[]") ?: "[]"
+            val local = parseRules(localText)
+            if (local != null) {
+                if (local.skipped > 0) {
+                    pendingStatusMessage = "Đã đọc ${local.rules.size} rule, bỏ qua ${local.skipped} rule lỗi trong config nội bộ."
+                }
+                return local.rules
             }
-        } catch (_: Throwable) {
         }
-        return out
+
+        val backupText = RuleBackupStore.read(context)
+        if (!backupText.isNullOrBlank()) {
+            val restored = parseRules(backupText)
+            if (restored != null) {
+                prefs.edit().putString(KEY, rulesToArray(restored.rules).toString()).apply()
+                pendingStatusMessage = if (restored.skipped > 0) {
+                    "Đã tự restore ${restored.rules.size} rule từ ${RuleBackupStore.DISPLAY_PATH}; bỏ qua ${restored.skipped} rule lỗi."
+                } else {
+                    "Đã tự restore ${restored.rules.size} rule từ ${RuleBackupStore.DISPLAY_PATH}."
+                }
+                return restored.rules
+            }
+            pendingStatusMessage = "Tìm thấy backup nhưng JSON không đọc được; cần cấu hình rule lại."
+        }
+
+        return mutableListOf()
     }
 
     fun save(context: Context, rules: List<CanRule>) {
+        val array = rulesToArray(rules)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY, array.toString())
+            .apply()
+
+        val backup = JSONObject().apply {
+            put("schemaVersion", BACKUP_SCHEMA_VERSION)
+            put("savedAt", System.currentTimeMillis())
+            put("rules", array)
+        }
+        if (!RuleBackupStore.write(context, backup.toString(2))) {
+            pendingStatusMessage = "Đã lưu rule trong app nhưng chưa ghi được backup ${RuleBackupStore.DISPLAY_PATH}."
+        }
+    }
+
+    private fun rulesToArray(rules: List<CanRule>): JSONArray {
         val array = JSONArray()
         rules.forEach { r ->
             array.put(JSONObject().apply {
@@ -232,7 +270,84 @@ object RuleStore {
                 put("unsigned", r.unsignedByte)
             })
         }
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, array.toString()).apply()
+        return array
+    }
+
+    /**
+     * Backward compatible:
+     * - format cũ: top-level JSONArray
+     * - format mới: { schemaVersion, rules: [...] }
+     * - field module/action/target thiếu => CANBUS/START/LEFT
+     * - rule lỗi độc lập bị skip, các rule còn đọc được vẫn restore.
+     */
+    private fun parseRules(text: String): ParseResult? {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return null
+
+        val array = try {
+            if (trimmed.startsWith("[")) {
+                JSONArray(trimmed)
+            } else {
+                JSONObject(trimmed).optJSONArray("rules") ?: return null
+            }
+        } catch (_: Throwable) {
+            return null
+        }
+
+        val out = mutableListOf<CanRule>()
+        var skipped = 0
+        for (i in 0 until array.length()) {
+            val o = array.optJSONObject(i)
+            if (o == null) {
+                skipped++
+                continue
+            }
+
+            try {
+                if (!o.has("index") || !o.has("position") || (!o.has("expected") && !o.has("expectedValue"))) {
+                    skipped++
+                    continue
+                }
+
+                val index = o.optInt("index", -1)
+                val position = o.optInt("position", -1)
+                if (index < 0 || position < 0) {
+                    skipped++
+                    continue
+                }
+
+                val module = runCatching {
+                    RuleModule.valueOf(o.optString("module", RuleModule.CANBUS.name))
+                }.getOrDefault(RuleModule.CANBUS)
+                val action = runCatching {
+                    RuleAction.valueOf(o.optString("action", RuleAction.START.name))
+                }.getOrDefault(RuleAction.START)
+                val target = runCatching {
+                    SignalTarget.valueOf(o.optString("target", SignalTarget.LEFT.name))
+                }.getOrDefault(SignalTarget.LEFT)
+                val rawId = o.optString("id", "").trim()
+                val expected = if (o.has("expected")) {
+                    o.optInt("expected", 0)
+                } else {
+                    o.optInt("expectedValue", 0)
+                }
+
+                out += CanRule(
+                    id = rawId.ifEmpty { UUID.randomUUID().toString() },
+                    enabled = o.optBoolean("enabled", true),
+                    module = module,
+                    action = action,
+                    target = target,
+                    index = index,
+                    position = position,
+                    expectedValue = expected,
+                    unsignedByte = o.optBoolean("unsigned", o.optBoolean("unsignedByte", false))
+                )
+            } catch (_: Throwable) {
+                skipped++
+            }
+        }
+        return ParseResult(out, skipped)
     }
 }
 
@@ -241,9 +356,15 @@ object SettingsStore {
     private const val ENABLED = "enabled"
     private const val VOLUME = "volume"
     private const val STOP_MODE = "stop_mode"
+    private const val TIMEOUT_MS = "timeout_ms"
     private const val MONITOR_FILTER_MODE = "monitor_filter_mode"
     private const val MONITOR_FILTER_MODULE = "monitor_filter_module"
     private const val MONITOR_FILTER_INDEX = "monitor_filter_index"
+    private const val MONITOR_FILTER_INDEXES = "monitor_filter_indexes"
+
+    const val DEFAULT_TIMEOUT_MS = 1500
+    const val MAX_TIMEOUT_MS = 2000
+    const val TIMEOUT_STEP_MS = 100
 
     fun isEnabled(context: Context): Boolean =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(ENABLED, true)
@@ -271,15 +392,28 @@ object SettingsStore {
             .apply()
     }
 
+    fun timeoutMillis(context: Context): Int {
+        val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getInt(TIMEOUT_MS, DEFAULT_TIMEOUT_MS)
+        return normalizeTimeout(raw)
+    }
+
+    fun setTimeoutMillis(context: Context, value: Int) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putInt(TIMEOUT_MS, normalizeTimeout(value))
+            .apply()
+    }
+
+    private fun normalizeTimeout(value: Int): Int {
+        val safe = value.coerceIn(0, MAX_TIMEOUT_MS)
+        return ((safe + TIMEOUT_STEP_MS / 2) / TIMEOUT_STEP_MS) * TIMEOUT_STEP_MS
+    }
+
     fun monitorFilterMode(context: Context): MonitorFilterMode {
         val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(MONITOR_FILTER_MODE, MonitorFilterMode.ALL.name)
             ?: MonitorFilterMode.ALL.name
-        return try {
-            MonitorFilterMode.valueOf(raw)
-        } catch (_: Throwable) {
-            MonitorFilterMode.ALL
-        }
+        return runCatching { MonitorFilterMode.valueOf(raw) }.getOrDefault(MonitorFilterMode.ALL)
     }
 
     fun monitorFilterModule(context: Context): String {
@@ -288,18 +422,37 @@ object SettingsStore {
         return if (raw == RuleModule.MAIN.name) RuleModule.MAIN.name else RuleModule.CANBUS.name
     }
 
-    fun monitorFilterIndex(context: Context): Int =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getInt(MONITOR_FILTER_INDEX, 1019)
-            .coerceAtLeast(0)
+    fun monitorFilterIndexes(context: Context): Set<Int> {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val raw = prefs.getString(MONITOR_FILTER_INDEXES, null)
+        if (!raw.isNullOrBlank()) {
+            val parsed = raw.split(',')
+                .mapNotNull { it.trim().toIntOrNull() }
+                .filter { it >= 0 }
+                .toSortedSet()
+            if (parsed.isNotEmpty()) return parsed
+        }
+        return setOf(prefs.getInt(MONITOR_FILTER_INDEX, 1019).coerceAtLeast(0))
+    }
 
-    fun setMonitorFilter(context: Context, mode: MonitorFilterMode, module: String, index: Int) {
+    /** Backward-compatible getter cho code cũ. */
+    fun monitorFilterIndex(context: Context): Int = monitorFilterIndexes(context).firstOrNull() ?: 1019
+
+    fun setMonitorFilter(context: Context, mode: MonitorFilterMode, module: String, indexes: Set<Int>) {
         val safeModule = if (module == RuleModule.MAIN.name) RuleModule.MAIN.name else RuleModule.CANBUS.name
+        val safeIndexes = indexes.filter { it >= 0 }.toSortedSet()
+        val first = safeIndexes.firstOrNull() ?: 0
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString(MONITOR_FILTER_MODE, mode.name)
             .putString(MONITOR_FILTER_MODULE, safeModule)
-            .putInt(MONITOR_FILTER_INDEX, index.coerceAtLeast(0))
+            .putString(MONITOR_FILTER_INDEXES, safeIndexes.joinToString(","))
+            .putInt(MONITOR_FILTER_INDEX, first)
             .apply()
+    }
+
+    /** Backward-compatible overload cho code cũ. */
+    fun setMonitorFilter(context: Context, mode: MonitorFilterMode, module: String, index: Int) {
+        setMonitorFilter(context, mode, module, setOf(index.coerceAtLeast(0)))
     }
 }
 
@@ -321,17 +474,12 @@ data class RuleStateSnapshot(
 
 /**
  * RuleEngine fast-path cho CANBUS/MAIN có tần suất cao.
- *
- * Hot-path background không tạo FytEvent và không copy IntArray: đọc trực tiếp IntArray AIDL
- * đồng bộ ngay trong callback rồi trả về.
- *
  * - Rule index sẵn theo module + index để lookup O(1).
- * - TIMEOUT: chỉ START rule được đăng ký vào fast-path; target false sau 1.5 giây không có START match.
- * - TRIGGER: target giữ true cho tới STOP rule đúng target. Không có timeout.
- * - Target đã true: START lặp lại chỉ refresh heartbeat ở TIMEOUT; TRIGGER bỏ qua.
+ * - TIMEOUT: chỉ START rule vào fast-path; target false sau thời gian cấu hình không có START match.
+ * - TRIGGER: target giữ true cho tới STOP rule đúng target.
  */
 class RuleEngine(
-    private val holdMillis: Long = DEFAULT_HOLD_MS,
+    initialHoldMillis: Long = DEFAULT_HOLD_MS,
     private val onStateChanged: (RuleStateSnapshot) -> Unit
 ) {
     private val handler = Handler(Looper.getMainLooper())
@@ -340,6 +488,7 @@ class RuleEngine(
     @Volatile private var canRulesByIndex: Map<Int, Array<CanRule>> = emptyMap()
     @Volatile private var mainRulesByIndex: Map<Int, Array<CanRule>> = emptyMap()
     @Volatile private var stopMode: StopMode = StopMode.TIMEOUT
+    @Volatile private var holdMillis: Long = initialHoldMillis.coerceIn(0L, MAX_HOLD_MS)
 
     private val targetActive = BooleanArray(SignalTarget.values().size)
     private val lastMatchElapsed = LongArray(SignalTarget.values().size)
@@ -350,7 +499,6 @@ class RuleEngine(
     @Volatile var active: Boolean = false
         private set
 
-    /** Binder fast-path: O(1), không allocation. */
     fun hasRuleFor(module: String, index: Int): Boolean {
         return when (module) {
             RuleModule.CANBUS.name -> canRulesByIndex[index] != null
@@ -365,6 +513,14 @@ class RuleEngine(
         stopMode = mode
         clearStateLocked()
         rebuildRuleIndexesLocked()
+    }
+
+    @Synchronized
+    fun setHoldMillis(value: Long) {
+        val safe = value.coerceIn(0L, MAX_HOLD_MS)
+        if (holdMillis == safe) return
+        holdMillis = safe
+        if (stopMode == StopMode.TIMEOUT) clearStateLocked()
     }
 
     @Synchronized
@@ -390,9 +546,6 @@ class RuleEngine(
         mainRulesByIndex = main.mapValues { (_, list) -> list.toTypedArray() }
     }
 
-    /**
-     * Được gọi đồng bộ ngay trong IModuleCallback.update(). Không giữ reference tới values sau khi return.
-     */
     @Synchronized
     fun onRawEvent(module: String, index: Int, values: IntArray?) {
         val relevantRules = when (module) {
@@ -406,7 +559,6 @@ class RuleEngine(
         var stateChanged = false
         val now = SystemClock.elapsedRealtime()
 
-        // Trigger TẮT ưu tiên nếu cùng một event vô tình match cả START và STOP của cùng target.
         if (stopMode == StopMode.TRIGGER) {
             for (rule in relevantRules) {
                 if (rule.action != RuleAction.STOP || !matches(rule, values)) continue
@@ -427,9 +579,7 @@ class RuleEngine(
             if ((stoppedMask and (1 shl ordinal)) != 0) continue
 
             if (targetActive[ordinal]) {
-                if (stopMode == StopMode.TIMEOUT) {
-                    lastMatchElapsed[ordinal] = now
-                }
+                if (stopMode == StopMode.TIMEOUT) lastMatchElapsed[ordinal] = now
                 continue
             }
 
@@ -441,7 +591,7 @@ class RuleEngine(
 
         if (stateChanged) emitStateLocked()
         if (stopMode == StopMode.TIMEOUT && activeCount > 0) {
-            scheduleWatchdogLocked(WATCHDOG_INTERVAL_MS)
+            scheduleWatchdogLocked(watchdogDelayLocked())
         }
     }
 
@@ -498,7 +648,11 @@ class RuleEngine(
         }
 
         if (changed) emitStateLocked()
-        if (activeCount > 0) scheduleWatchdogLocked(WATCHDOG_INTERVAL_MS)
+        if (activeCount > 0) scheduleWatchdogLocked(watchdogDelayLocked())
+    }
+
+    private fun watchdogDelayLocked(): Long {
+        return if (holdMillis <= 0L) 0L else minOf(WATCHDOG_INTERVAL_MS, holdMillis)
     }
 
     private fun scheduleWatchdogLocked(delayMillis: Long) {
@@ -520,6 +674,7 @@ class RuleEngine(
 
     companion object {
         private const val DEFAULT_HOLD_MS = 1500L
+        private const val MAX_HOLD_MS = 2000L
         private const val WATCHDOG_INTERVAL_MS = 100L
     }
 }
