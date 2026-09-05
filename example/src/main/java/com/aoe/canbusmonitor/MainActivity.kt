@@ -29,6 +29,7 @@ class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var monitorText: TextView
     private lateinit var latestCanText: TextView
+    private lateinit var filterStatusText: TextView
     private lateinit var rulesContainer: LinearLayout
     private lateinit var serviceStatusText: TextView
     private lateinit var volumeLabel: TextView
@@ -48,6 +49,12 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Nạp filter trước khi dựng tab monitor để trạng thái hiển thị đúng ngay khi mở app.
+        MonitorStore.configureFilter(
+            SettingsStore.monitorFilterMode(this),
+            SettingsStore.monitorFilterIndex(this)
+        )
 
         // Dựng giao diện trước khi khởi động service hoặc hiện hộp thoại quyền thông báo.
         // Nhờ vậy app vẫn dùng được trên điện thoại Android thường để thử giao diện và âm thanh.
@@ -169,14 +176,25 @@ class MainActivity : Activity() {
                 if (!monitorPaused) lastMonitorVersion = -1L
             }
         }
+        val filter = Button(this).apply {
+            text = "LỌC"
+            setOnClickListener { showMonitorFilterDialog() }
+        }
         val export = Button(this).apply {
             text = "XUẤT TXT"
             setOnClickListener { exportMonitorLog() }
         }
         controls.addView(clear, weightParams())
         controls.addView(pause, weightParams())
+        controls.addView(filter, weightParams())
         controls.addView(export, weightParams())
         root.addView(controls)
+
+        filterStatusText = TextView(this).apply {
+            text = "Bộ lọc log: ${MonitorStore.filterSummary()} • chỉ ảnh hưởng monitor/log, không ảnh hưởng luật phát tiếng"
+            setPadding(0, dp(5), 0, dp(2))
+        }
+        root.addView(filterStatusText)
 
         latestCanText = TextView(this).apply {
             text = "CANBUS mới nhất: đang chờ..."
@@ -230,7 +248,7 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(10), dp(12), dp(16))
         }
         root.addView(TextView(this).apply {
-            text = "Chỉ cần một luật đang bật khớp dữ liệu CAN là phát âm thanh. Âm thanh chỉ dừng khi không còn luật nào khớp. Cách này xử lý an toàn trường hợp đèn cảnh báo nguy hiểm làm cả trái và phải cùng hoạt động; nếu hazard có CAN index riêng thì thêm index đó thành một luật khác."
+            text = "Chỉ cần một luật đang bật khớp dữ liệu CAN là phát âm thanh. Frame match đầu tiên phát ngay; các frame match tiếp theo chỉ giữ trạng thái, không khởi động lại âm thanh. Một khoảng giữ ngắn giúp nối các frame ON/OFF theo nhịp chớp CAN thành một phiên âm thanh liên tục. Hazard vẫn hoạt động nếu bất kỳ luật trái/phải hoặc luật hazard riêng khớp."
             textSize = 15f
             setPadding(0, 0, 0, dp(10))
         })
@@ -338,6 +356,70 @@ class MainActivity : Activity() {
         SettingsStore.setVolume(this, volumeSeek.progress / 100f)
         sendServiceAction(TurnSignalService.ACTION_REFRESH)
         if (showToast) toast("Đã lưu cài đặt âm thanh")
+    }
+
+    private fun showMonitorFilterDialog() {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(4))
+        }
+        root.addView(TextView(this).apply {
+            text = "CANBUS index cần lọc"
+        })
+        val indexEdit = EditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            setText(SettingsStore.monitorFilterIndex(this@MainActivity).toString())
+            selectAll()
+        }
+        root.addView(indexEdit)
+        root.addView(TextView(this).apply {
+            text = "Filter chỉ tác động phần log/monitor. Rule phát âm thanh vẫn nhận CAN đầy đủ."
+            setPadding(0, dp(8), 0, dp(4))
+        })
+
+        var selected = when (SettingsStore.monitorFilterMode(this)) {
+            MonitorFilterMode.ALL -> 0
+            MonitorFilterMode.ONLY_CAN_INDEX -> 1
+            MonitorFilterMode.EXCLUDE_CAN_INDEX -> 2
+        }
+        val choices = arrayOf(
+            "Tất cả log",
+            "Chỉ hiện CANBUS:index này",
+            "Loại trừ CANBUS:index này"
+        )
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Bộ lọc log CANBUS")
+            .setView(root)
+            .setSingleChoiceItems(choices, selected) { _, which -> selected = which }
+            .setNegativeButton("HỦY", null)
+            .setPositiveButton("ÁP DỤNG", null)
+            .create()
+
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val index = indexEdit.text.toString().toIntOrNull()
+                if (selected != 0 && (index == null || index < 0)) {
+                    toast("CANBUS index phải là số từ 0 trở lên")
+                    return@setOnClickListener
+                }
+                val mode = when (selected) {
+                    1 -> MonitorFilterMode.ONLY_CAN_INDEX
+                    2 -> MonitorFilterMode.EXCLUDE_CAN_INDEX
+                    else -> MonitorFilterMode.ALL
+                }
+                val safeIndex = index ?: SettingsStore.monitorFilterIndex(this)
+                SettingsStore.setMonitorFilter(this, mode, safeIndex)
+                MonitorStore.configureFilter(mode, safeIndex)
+                filterStatusText.text = "Bộ lọc log: ${MonitorStore.filterSummary()} • chỉ ảnh hưởng monitor/log, không ảnh hưởng luật phát tiếng"
+                lastMonitorVersion = -1L
+                refreshMonitor()
+                sendServiceAction(TurnSignalService.ACTION_REFRESH)
+                toast("Đã áp dụng: ${MonitorStore.filterSummary()}")
+                dialog.dismiss()
+            }
+        }
+        dialog.show()
     }
 
     private fun refreshMonitor() {
