@@ -7,6 +7,7 @@ import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -36,21 +37,28 @@ class AudioEngine(private val context: Context) {
     private var ruleTrack: AudioTrack? = null
     private var testTrack: AudioTrack? = null
 
-    // Engine đã hỗ trợ gain thật tới 300%. UI hiện tại có thể truyền 0..1,
-    // nhưng khi UI nâng lên 0..300% thì không cần đổi lại AudioEngine.
+    // Engine hỗ trợ gain thật tới 300%.
     private var gain = SettingsStore.volume(context).coerceIn(0f, MAX_GAIN)
 
     init {
         try {
             decodedPcm = decodeResourceToPcm16(R.raw.only_tik_tok)
+            val pcm = decodedPcm ?: throw IllegalStateException("PCM null sau khi decode")
+            require(pcm.samples.isNotEmpty()) { "PCM rỗng sau khi decode" }
+
             rebuildTracksLocked()
-            loaded = true
+            loaded = ruleTrack?.state == AudioTrack.STATE_INITIALIZED &&
+                testTrack?.state == AudioTrack.STATE_INITIALIZED
+            require(loaded) { "AudioTrack chưa sẵn sàng sau khi preload" }
+
             RuntimeState.audioReady = true
             RuntimeState.lastError = null
+            Log.i(TAG, "Audio ready: ${pcm.sampleRate}Hz, ${pcm.channelCount}ch, ${pcm.samples.size} samples, delay=${pcm.encoderDelayFrames}, padding=${pcm.encoderPaddingFrames}")
         } catch (t: Throwable) {
             loaded = false
             RuntimeState.audioReady = false
             RuntimeState.lastError = "Audio PCM: ${t.javaClass.simpleName}: ${t.message}"
+            Log.e(TAG, "Khởi tạo AudioEngine thất bại", t)
         }
     }
 
@@ -62,7 +70,16 @@ class AudioEngine(private val context: Context) {
 
         // Gain >100% phải nhân trực tiếp PCM. Việc rebuild chỉ xảy ra khi người dùng
         // thay đổi volume, không xảy ra mỗi lần CANBUS bắn event.
-        if (loaded) rebuildTracksLocked()
+        if (loaded) {
+            try {
+                rebuildTracksLocked()
+            } catch (t: Throwable) {
+                loaded = false
+                RuntimeState.audioReady = false
+                RuntimeState.lastError = "Audio rebuild: ${t.javaClass.simpleName}: ${t.message}"
+                Log.e(TAG, "Rebuild AudioTrack thất bại", t)
+            }
+        }
     }
 
     @Synchronized
@@ -73,11 +90,19 @@ class AudioEngine(private val context: Context) {
 
     @Synchronized
     private fun startRuleIfReady() {
-        if (!loaded || !desiredRuleActive) return
+        if (!loaded || !desiredRuleActive) {
+            if (!loaded) RuntimeState.lastError = RuntimeState.lastError ?: "Audio chưa sẵn sàng"
+            return
+        }
         val track = ruleTrack ?: return
+        if (track.state != AudioTrack.STATE_INITIALIZED) {
+            RuntimeState.lastError = "Rule AudioTrack không initialized"
+            return
+        }
         if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
             rewindStaticTrack(track)
             track.play()
+            Log.d(TAG, "Rule AudioTrack play")
         }
     }
 
@@ -94,11 +119,27 @@ class AudioEngine(private val context: Context) {
     @Synchronized
     fun startTest() {
         desiredTestActive = true
-        if (!loaded) return
-        val track = testTrack ?: return
+        if (!loaded) {
+            RuntimeState.lastError = RuntimeState.lastError ?: "Audio chưa sẵn sàng để thử"
+            Log.w(TAG, "startTest bỏ qua vì audio chưa loaded: ${RuntimeState.lastError}")
+            return
+        }
+        val track = testTrack
+        if (track == null) {
+            RuntimeState.lastError = "Test AudioTrack = null"
+            Log.e(TAG, "startTest: testTrack null")
+            return
+        }
+        if (track.state != AudioTrack.STATE_INITIALIZED) {
+            RuntimeState.lastError = "Test AudioTrack không initialized"
+            Log.e(TAG, "startTest: AudioTrack state=${track.state}")
+            return
+        }
         if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
             rewindStaticTrack(track)
             track.play()
+            RuntimeState.lastError = null
+            Log.i(TAG, "Test AudioTrack play, state=${track.playState}")
         }
     }
 
@@ -113,7 +154,7 @@ class AudioEngine(private val context: Context) {
      * Khi đang phát, track mới sẽ tiếp tục phát sau khi rebuild.
      */
     private fun rebuildTracksLocked() {
-        val pcm = decodedPcm ?: return
+        val pcm = decodedPcm ?: throw IllegalStateException("Chưa có PCM")
         val keepRulePlaying = desiredRuleActive
         val keepTestPlaying = desiredTestActive
 
@@ -123,14 +164,18 @@ class AudioEngine(private val context: Context) {
         testTrack = null
 
         val gainedSamples = applyDigitalGain(pcm.samples, gain)
-        ruleTrack = createLoopingStaticTrack(pcm, gainedSamples)
-        testTrack = createLoopingStaticTrack(pcm, gainedSamples)
+        ruleTrack = createLoopingStaticTrack(pcm, gainedSamples, "rule")
+        testTrack = createLoopingStaticTrack(pcm, gainedSamples, "test")
 
         if (keepRulePlaying) ruleTrack?.play()
         if (keepTestPlaying) testTrack?.play()
     }
 
-    private fun createLoopingStaticTrack(pcm: DecodedPcm, samples: ShortArray): AudioTrack {
+    private fun createLoopingStaticTrack(
+        pcm: DecodedPcm,
+        samples: ShortArray,
+        label: String
+    ): AudioTrack {
         require(samples.isNotEmpty()) { "PCM rỗng" }
         val channelMask = when (pcm.channelCount) {
             1 -> AudioFormat.CHANNEL_OUT_MONO
@@ -151,7 +196,8 @@ class AudioEngine(private val context: Context) {
             pcm.sampleRate,
             channelMask,
             AudioFormat.ENCODING_PCM_16BIT
-        ).coerceAtLeast(0)
+        )
+        require(minBuffer >= 0) { "getMinBufferSize lỗi $minBuffer" }
 
         val track = AudioTrack.Builder()
             .setAudioAttributes(audioAttributes)
@@ -162,21 +208,33 @@ class AudioEngine(private val context: Context) {
 
         if (track.state != AudioTrack.STATE_INITIALIZED) {
             track.release()
-            throw IllegalStateException("AudioTrack không khởi tạo được")
+            throw IllegalStateException("AudioTrack $label không khởi tạo được, state=${track.state}")
         }
 
-        val written = track.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
-        if (written != samples.size) {
-            track.release()
-            throw IllegalStateException("AudioTrack chỉ ghi $written/${samples.size} mẫu PCM")
+        var totalWritten = 0
+        while (totalWritten < samples.size) {
+            val written = track.write(
+                samples,
+                totalWritten,
+                samples.size - totalWritten,
+                AudioTrack.WRITE_BLOCKING
+            )
+            if (written <= 0) {
+                track.release()
+                throw IllegalStateException("AudioTrack $label write lỗi $written tại $totalWritten/${samples.size}")
+            }
+            totalWritten += written
         }
 
         val loopResult = track.setLoopPoints(0, frameCount, -1)
         if (loopResult != AudioTrack.SUCCESS) {
             track.release()
-            throw IllegalStateException("AudioTrack setLoopPoints lỗi $loopResult")
+            throw IllegalStateException("AudioTrack $label setLoopPoints lỗi $loopResult, frames=$frameCount")
         }
+
         track.setPlaybackHeadPosition(0)
+        track.setVolume(1.0f)
+        Log.i(TAG, "Preload $label AudioTrack: frames=$frameCount, bytes=$bytesNeeded, buffer=${maxOf(bytesNeeded, minBuffer)}")
         return track
     }
 
@@ -193,7 +251,8 @@ class AudioEngine(private val context: Context) {
 
     /**
      * Decode resource MP3 thành PCM 16-bit bằng MediaCodec một lần duy nhất.
-     * MediaFormat encoder-delay / encoder-padding là số frame cần trim khỏi đầu/cuối.
+     * Không ép KEY_PCM_ENCODING vào compressed input format vì một số codec vendor
+     * (đặc biệt head-unit Android/FYT) có thể từ chối format MP3 đã bị sửa.
      */
     private fun decodeResourceToPcm16(resId: Int): DecodedPcm {
         val extractor = MediaExtractor()
@@ -222,10 +281,7 @@ class AudioEngine(private val context: Context) {
             val encoderDelayFrames = format.intOrZero(MediaFormat.KEY_ENCODER_DELAY)
             val encoderPaddingFrames = format.intOrZero(MediaFormat.KEY_ENCODER_PADDING)
 
-            // Yêu cầu decoder trả PCM 16-bit để AudioTrack có đường dữ liệu đơn giản nhất.
-            format.setInteger(MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_16BIT)
             extractor.selectTrack(trackIndex)
-
             codec = MediaCodec.createDecoderByType(mime)
             codec.configure(format, null, null, 0)
             codec.start()
@@ -237,11 +293,15 @@ class AudioEngine(private val context: Context) {
             var outputSampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
             var outputChannels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
             var outputEncoding = AudioFormat.ENCODING_PCM_16BIT
+            var idleLoops = 0
 
             while (!outputEos) {
+                var madeProgress = false
+
                 if (!inputEos) {
                     val inputIndex = codec.dequeueInputBuffer(CODEC_TIMEOUT_US)
                     if (inputIndex >= 0) {
+                        madeProgress = true
                         val inputBuffer = codec.getInputBuffer(inputIndex)
                             ?: throw IllegalStateException("Decoder input buffer null")
                         inputBuffer.clear()
@@ -271,6 +331,7 @@ class AudioEngine(private val context: Context) {
                 when (val outputIndex = codec.dequeueOutputBuffer(info, CODEC_TIMEOUT_US)) {
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        madeProgress = true
                         val outputFormat = codec.outputFormat
                         outputSampleRate = outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                         outputChannels = outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
@@ -278,8 +339,10 @@ class AudioEngine(private val context: Context) {
                             MediaFormat.KEY_PCM_ENCODING,
                             AudioFormat.ENCODING_PCM_16BIT
                         )
+                        Log.i(TAG, "Decoder output: $outputFormat")
                     }
                     else -> if (outputIndex >= 0) {
+                        madeProgress = true
                         if (info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
                             val outputBuffer = codec.getOutputBuffer(outputIndex)
                                 ?: throw IllegalStateException("Decoder output buffer null")
@@ -293,6 +356,15 @@ class AudioEngine(private val context: Context) {
                         codec.releaseOutputBuffer(outputIndex, false)
                     }
                 }
+
+                if (madeProgress) {
+                    idleLoops = 0
+                } else {
+                    idleLoops++
+                    if (idleLoops > MAX_IDLE_LOOPS) {
+                        throw IllegalStateException("MediaCodec decode timeout")
+                    }
+                }
             }
 
             require(outputEncoding == AudioFormat.ENCODING_PCM_16BIT) {
@@ -304,6 +376,8 @@ class AudioEngine(private val context: Context) {
 
             val rawBytes = out.toByteArray()
             require(rawBytes.size >= 2) { "Decoder không trả dữ liệu PCM" }
+            require(rawBytes.size % 2 == 0) { "PCM 16-bit có số byte lẻ: ${rawBytes.size}" }
+
             val shortBuffer = ByteBuffer.wrap(rawBytes)
                 .order(ByteOrder.LITTLE_ENDIAN)
                 .asShortBuffer()
@@ -318,8 +392,13 @@ class AudioEngine(private val context: Context) {
             val trimmed = if (endSample > startSample) {
                 untrimmed.copyOfRange(startSample, endSample)
             } else {
+                // Nếu metadata gapless của codec/vendor không hợp lệ thì ưu tiên có âm thanh,
+                // không để trim toàn bộ file thành rỗng.
                 untrimmed
             }
+
+            require(trimmed.isNotEmpty()) { "PCM rỗng sau trim" }
+            Log.i(TAG, "Decoded PCM: rawBytes=${rawBytes.size}, samples=${trimmed.size}, rate=$outputSampleRate, channels=$outputChannels")
 
             return DecodedPcm(
                 samples = trimmed,
@@ -351,10 +430,14 @@ class AudioEngine(private val context: Context) {
         if (track.playState == AudioTrack.PLAYSTATE_PLAYING) return
         try {
             track.setPlaybackHeadPosition(0)
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            Log.w(TAG, "setPlaybackHeadPosition thất bại, thử reloadStaticData", t)
             try {
                 track.reloadStaticData()
-            } catch (_: Throwable) {
+                track.setPlaybackHeadPosition(0)
+            } catch (reloadError: Throwable) {
+                RuntimeState.lastError = "Audio rewind: ${reloadError.javaClass.simpleName}: ${reloadError.message}"
+                Log.e(TAG, "reloadStaticData thất bại", reloadError)
             }
         }
     }
@@ -363,7 +446,8 @@ class AudioEngine(private val context: Context) {
         if (track == null) return
         try {
             if (track.playState == AudioTrack.PLAYSTATE_PLAYING) track.pause()
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            Log.w(TAG, "pause AudioTrack lỗi", t)
         }
         rewindStaticTrack(track)
     }
@@ -406,7 +490,9 @@ class AudioEngine(private val context: Context) {
     )
 
     companion object {
+        private const val TAG = "FYT AudioEngine"
         private const val CODEC_TIMEOUT_US = 10_000L
+        private const val MAX_IDLE_LOOPS = 500
         private const val MAX_GAIN = 3.0f
     }
 }
