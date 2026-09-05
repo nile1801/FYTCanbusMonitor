@@ -11,8 +11,8 @@ android {
         applicationId "com.aoe.canbusmonitor.turnsound"
         minSdk 33
         targetSdk 33
-        versionCode 8
-        versionName "1.4.3-can-fastpath"
+        versionCode 9
+        versionName "1.5.0-trigger-mapping"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
