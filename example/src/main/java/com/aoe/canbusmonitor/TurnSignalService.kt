@@ -24,7 +24,8 @@ class TurnSignalService : Service() {
     private val statusObserver = object : ConnectionObserver {
         override fun onConnected(toolkit: IRemoteToolkit?) {
             RuntimeState.fytConnected = toolkit != null
-            RuntimeState.lastError = null
+            // Không xóa lỗi AudioEngine nếu audio vẫn chưa READY.
+            if (RuntimeState.audioReady) RuntimeState.lastError = null
             updateNotification()
         }
 
@@ -44,7 +45,6 @@ class TurnSignalService : Service() {
         RuntimeState.serviceRunning = true
         RuntimeState.fytPackagePresent = isFytPackageAvailable()
 
-        // Filter log được lưu persistent. Nó chỉ tác động MonitorStore, không tác động RuleEngine.
         MonitorStore.configureFilter(
             SettingsStore.monitorFilterMode(this),
             SettingsStore.monitorFilterIndex(this)
@@ -53,7 +53,7 @@ class TurnSignalService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
 
-        // Khởi tạo AudioEngine ngay khi service chạy để SoundPool giải mã MP3 và giữ mẫu âm thanh trong RAM.
+        // Decode MP3 một lần thành PCM trong RAM và khởi tạo AudioTrack ngay khi service chạy.
         audio = AudioEngine(this)
         ruleEngine = RuleEngine { active ->
             RuntimeState.ruleActive = active
@@ -66,10 +66,10 @@ class TurnSignalService : Service() {
         if (RuntimeState.fytPackagePresent) {
             connectToFyt()
         } else {
-            // Chế độ thử trên điện thoại/tablet Android thường: UI và âm thanh vẫn chạy,
-            // nhưng không đụng vào service FYT riêng của đầu xe là com.syu.ms.
+            // Chế độ thử trên điện thoại/tablet Android thường: UI và audio vẫn chạy.
             RuntimeState.fytConnected = false
-            RuntimeState.lastError = null
+            // Trước đây dòng này luôn xóa lastError và che mất lỗi decode/AudioTrack.
+            if (RuntimeState.audioReady) RuntimeState.lastError = null
             updateNotification()
         }
     }
@@ -100,7 +100,10 @@ class TurnSignalService : Service() {
         try {
             MsToolkitConnection.instance.connect(applicationContext)
         } catch (t: Throwable) {
-            RuntimeState.lastError = "Kết nối FYT: ${t.javaClass.simpleName}: ${t.message}"
+            // Nếu audio đang lỗi thì giữ lỗi audio vì nó liên quan trực tiếp nút thử/xi nhan.
+            if (RuntimeState.audioReady) {
+                RuntimeState.lastError = "Kết nối FYT: ${t.javaClass.simpleName}: ${t.message}"
+            }
             updateNotification()
         }
     }
@@ -186,7 +189,8 @@ class TurnSignalService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val status = when {
-            !RuntimeState.fytPackagePresent -> "Chế độ thử điện thoại • không có dịch vụ FYT"
+            !RuntimeState.audioReady -> "Audio chưa sẵn sàng"
+            !RuntimeState.fytPackagePresent -> "Chế độ thử điện thoại • audio đã sẵn sàng"
             !RuntimeState.fytConnected -> "Đang chờ dịch vụ FYT CAN"
             RuntimeState.ruleActive && SettingsStore.isEnabled(this) -> "Đã kết nối CAN • âm xi nhan đang phát"
             else -> "Đã kết nối CAN • đang giám sát"
