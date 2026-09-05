@@ -11,6 +11,14 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
+/**
+ * Monitor là công cụ debug, không cần chạy khi app ở background hoặc đang ở tab khác.
+ * Tắt capture giúp callback CAN non-rule return trước khi copy array/tạo FytEvent.
+ */
+object MonitorCaptureState {
+    @Volatile var enabled: Boolean = false
+}
+
 private object MonitorDispatcher {
     private val threadNumber = AtomicInteger(1)
     private val executor = ThreadPoolExecutor(
@@ -54,7 +62,13 @@ class FytModuleCallback(
         // Kiểm tra thật sớm trước khi copy array/tạo FytEvent. Với CANBUS, RuleEngine truyền
         // predicate O(1) dựa trên index; index không có rule sẽ không đi vào đường audio.
         val deliverToRule = shouldDeliverToRule?.invoke(updateCode) ?: true
-        val deliverToMonitor = MonitorStore.shouldQueueFast(moduleName, updateCode)
+
+        // Monitor chỉ capture khi tab Giám sát đang thực sự mở và không pause.
+        // Filter cũng được xét trước queue, ví dụ exclude 1019 thì 1019 bị bỏ tại đây.
+        val deliverToMonitor = MonitorCaptureState.enabled &&
+            MonitorStore.shouldQueueFast(moduleName, updateCode)
+
+        // Fastest path: background + index không có rule => return ngay, không allocation.
         if (!deliverToRule && !deliverToMonitor) return
 
         val event = FytEvent(
@@ -68,8 +82,7 @@ class FytModuleCallback(
         // Đường ưu tiên: chỉ index được RuleEngine quan tâm mới vào đây.
         if (deliverToRule) onEvent(event)
 
-        // Đường phụ: filter đã được xét trước queue. Ví dụ exclude CANBUS:1019 thì 1019
-        // không còn tạo Runnable trong queue monitor. Queue vẫn giới hạn để bảo vệ callback.
+        // Đường phụ: queue monitor riêng, giới hạn để không bao giờ làm nghẽn đường audio.
         if (deliverToMonitor) MonitorDispatcher.submit(event)
     }
 }
